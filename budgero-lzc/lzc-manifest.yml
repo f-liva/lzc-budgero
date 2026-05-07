@@ -1,0 +1,37 @@
+lzc-sdk-version: '0.1'
+name: Budgero
+package: cloud.lazycat.app.budgero
+version: 1.0.0
+description: Manual-first private budgeting (self-hosted). No bank connections.
+homepage: https://budgero.app
+author: Federico Liva
+locales:
+  en:
+    name: Budgero
+    description: Manual-first private budgeting (self-hosted). No bank connections.
+  it:
+    name: Budgero
+    description: Budgeting privato manuale (self-hosted). Nessun collegamento bancario.
+  zh:
+    name: Budgero
+    description: 手动优先的隐私预算应用（自托管）。无需连接银行账户。
+
+application:
+  routes:
+    - /=http://budgero.cloud.lazycat.app.budgero.lzcapp:3001
+  subdomain: budgero
+
+services:
+  budgero:
+    image: docker.io/fliva/lzc-budgero:1.0.0
+    binds:
+      - /lzcapp/var/data:/data
+    environment:
+      - DB_PATH=/data/budgero.db
+      - PORT=3001
+      - SELF_HOSTABLE=true
+      - SELF_HOST_JWT_TTL_HOURS=720
+      - BUDGERO_ADMIN_USER=admin
+      - BUDGERO_ADMIN_PASS=changeme-on-first-login
+      - BUDGERO_ADMIN_NAME=Admin
+      # - CURRENCYLAYER_API_KEY=  # opzionale, abilita multi-currency rates
