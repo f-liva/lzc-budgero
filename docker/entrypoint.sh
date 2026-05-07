@@ -13,15 +13,20 @@ export SELF_HOST_JWT_SECRET="$(cat "$JWT_FILE")"
 if [ -n "${BUDGERO_ADMIN_USER:-}" ] && [ -n "${BUDGERO_ADMIN_PASS:-}" ]; then
   # Skip header line, match exact username in first column. Avoids collision
   # with header column names like "ADMIN" when --username is "admin".
-  if ! /app/budgero admin list-users 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -qFx "$BUDGERO_ADMIN_USER"; then
+  if /app/budgero admin list-users 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -qFx "$BUDGERO_ADMIN_USER"; then
+    echo "[entrypoint] resetting password for existing user: $BUDGERO_ADMIN_USER"
+    /app/budgero admin reset-password \
+      --username "$BUDGERO_ADMIN_USER" \
+      --password "$BUDGERO_ADMIN_PASS" \
+      || echo "[entrypoint] reset-password failed"
+  else
     echo "[entrypoint] bootstrapping admin user: $BUDGERO_ADMIN_USER"
     /app/budgero admin create-user \
       --username "$BUDGERO_ADMIN_USER" \
       --password "$BUDGERO_ADMIN_PASS" \
       --name "${BUDGERO_ADMIN_NAME:-Admin}" \
-      --admin || echo "[entrypoint] admin create-user failed (user may already exist)"
-  else
-    echo "[entrypoint] admin user '$BUDGERO_ADMIN_USER' already exists, skipping bootstrap"
+      --admin \
+      || echo "[entrypoint] admin create-user failed"
   fi
 fi
 
