@@ -1,7 +1,7 @@
 lzc-sdk-version: '0.1'
 name: Budgero
 package: cloud.lazycat.app.budgero
-version: 1.0.8
+version: 1.0.10
 description: Manual-first private budgeting (self-hosted). No bank connections.
 homepage: https://budgero.app
 author: Federico Liva
@@ -23,10 +23,10 @@ application:
 
 services:
   budgero:
-    # Upstream budgero/budgero v1.13.0 (wrapper docker/Dockerfile), mirror sul
+    # Upstream budgero/budgero v1.13.2 (wrapper docker/Dockerfile), mirror sul
     # registry Lazycat (obbligatorio per lo store; copy-image via PS interop —
     # il login appstore vive nella lzc-cli di Windows, non in quella WSL).
-    image: registry.lazycat.cloud/u30562882/fliva/lzc-budgero:a65a8af6bb6775df
+    image: registry.lazycat.cloud/u30562882/fliva/lzc-budgero:cd20bcbafe383565
     binds:
       - /lzcapp/var/data:/data
     environment:
