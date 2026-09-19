@@ -1,0 +1,6 @@
+FROM fliva/budgero:pr-20-21
+USER root
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["serve"]
