@@ -1,7 +1,7 @@
 lzc-sdk-version: '0.1'
 name: Budgero
 package: cloud.lazycat.app.budgero
-version: 1.0.12
+version: 1.0.16
 description: Manual-first private budgeting (self-hosted). No bank connections.
 homepage: https://budgero.app
 author: Federico Liva
@@ -23,10 +23,11 @@ application:
 
 services:
   budgero:
-    # Upstream budgero/budgero v1.13.2 (wrapper docker/Dockerfile), mirror sul
-    # registry Lazycat (obbligatorio per lo store; copy-image via PS interop —
-    # il login appstore vive nella lzc-cli di Windows, non in quella WSL).
-    image: docker.io/fliva/lzc-budgero@sha256:1a53b404930846b8635d7bc8f8cc3d99905d99608f085dcfe812b8b8ea46fc8a
+    # Upstream v1.17.1 (include nativamente PR #43 SELF_HOST_PUBLIC_IP e #44
+    # XXX currency PayPal/SimpleFIN — niente più fork custom). Mirror sul
+    # registry Lazycat obbligatorio per lo store; copy-image via PS interop —
+    # il login appstore vive nella lzc-cli di Windows, non in quella WSL.
+    image: docker.io/fliva/lzc-budgero@sha256:3c39706c809a760a693a04336492f6912621f6c63af54f29a51ad21256090b1a
     binds:
       - /lzcapp/var/data:/data
     environment:
@@ -37,6 +38,12 @@ services:
       - BUDGERO_ADMIN_USER=admin
       - BUDGERO_ADMIN_PASS=changeme-on-first-login
       - BUDGERO_ADMIN_NAME=Admin
+      # Fix PSU-IP: il reverse-proxy/tunnel Lazycat non porta l'IP pubblico
+      # reale fino al container, RealIP() risolve un hop privato (172.28.x)
+      # e il bank-sync (Enable Banking) viene rifiutato ("PSU header not
+      # provided"). DDNS perché la linea di casa cambia IP ogni 24h — viene
+      # risolto live ad ogni richiesta ticket, non cachato.
+      - SELF_HOST_PUBLIC_IP=di369a4.glddns.com
       # v1.12.x: il server fa CheckOrigin sull'upgrade WebSocket e di default
       # ammette solo localhost — senza questa variabile la web-app da
       # budgero.federicoliva.it resta "Offline" (sync WS rifiutato 403 CORS).
