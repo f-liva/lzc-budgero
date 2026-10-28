@@ -75,6 +75,22 @@ cd budgero-lzc/
 ./install.sh
 ```
 
+**Per il proprio box, non per lo store**, usare `./install-local.sh`: il
+manifest versionato è generico (deve poter andare sullo store, quindi non
+contiene il dominio o il DDNS di nessuno), e lo script inietta i valori di
+`local.env` nella sola copia che viene pacchettata — build, backup del
+volume, install e verifica in un colpo.
+
+```bash
+cp local.env.example local.env   # gitignored, riempire
+./install-local.sh
+```
+
+Il manifest versionato viene ripristinato da un `trap EXIT`, anche se il
+build fallisce. Le due iniezioni sono verificate con un `grep` subito dopo il
+`sed`: un `SELF_HOST_PUBLIC_IP` non iniettato lascerebbe il bank-sync spento
+**in silenzio**, che è esattamente come si perde mezza giornata.
+
 ### 6. Install sul NAS via lpk-manager (SSH)
 
 `lzc-cli app install` da WSL fallisce con `ENETUNREACH` (rete Lazycat, IPv6).
@@ -124,6 +140,13 @@ device**: una versione vecchia si ferma con "Update required".
 | `BUDGERO_ADMIN_NAME` | `Admin` | Display name |
 | `CURRENCYLAYER_API_KEY` | (unset) | Opzionale, abilita multi-currency |
 | `SELF_HOST_JWT_SECRET` | auto da `/data/jwt.secret` | Non settare manualmente |
+| `WEBSOCKET_ALLOWED_ORIGINS` | `https://${LAZYCAT_APP_DOMAIN}` | Il server fa `CheckOrigin` sull'upgrade WS: un origin mancante = app "Offline". Aggiungere in coda, separati da virgola, eventuali domini propri (tunnel, reverse proxy) |
+| `SELF_HOST_PUBLIC_IP` | (unset) | Solo per il bank-sync (Enable Banking): IP pubblico o hostname DDNS. Vuota = bank-sync non funzionante, resto ok |
+
+Le variabili `LAZYCAT_*` sono iniettate dal box: `LAZYCAT_APP_DOMAIN` è il
+dominio di questa app (es. `budgero.chronos.heiyu.space`),
+`LAZYCAT_BOX_DOMAIN` quello del box. Mai inchiodare un dominio nel manifest —
+romperebbe ogni altro box.
 
 ## Limitazioni note
 
@@ -161,14 +184,21 @@ per costruzione se `BUDGERO_ADMIN_PASS` è vuota. I test stanno in
 bash docker/tests/entrypoint.test.sh
 ```
 
-### Closed-source binary
+### Il wrapper non patcha upstream
 
-Budgero non ha repo pubblico. Il wrapper può solo:
-- aggiungere entrypoint
-- iniettare env vars
-- gestire persistenza
+Budgero è **AGPL-3.0**, sorgente su
+[tombadilo-bombadilo/budgero](https://github.com/tombadilo-bombadilo/budgero)
+(era closed-source alle prime versioni di questo wrapper, da cui la vecchia
+nota qui). Il wrapper resta deliberatamente sottile:
 
-Patch del comportamento upstream impossibili. Ad ogni release upstream → re-build wrapper image.
+- aggiunge l'entrypoint (JWT, bootstrap admin)
+- inietta env vars
+- gestisce la persistenza
+
+Non patcha il binario: una modifica al comportamento va come PR upstream — le
+#43 (`SELF_HOST_PUBLIC_IP`) e #44 (currency `XXX` PayPal/SimpleFIN) sono
+state mergiate così, e il fork custom che prima serviva è sparito. Ad ogni
+release upstream → re-build dell'immagine wrapper.
 
 ### Tag upstream pinnato, non per digest
 
@@ -219,4 +249,9 @@ lzc-budgero/
 ## License
 
 - **Wrapper code** (Dockerfile, entrypoint, manifest, scripts): MIT, vedi `LICENSE`.
-- **Budgero binary**: proprietary, distribuito sotto i termini self-host di [budgero.app](https://budgero.app). Free per self-host, source non pubblico.
+- **Budgero**: AGPL-3.0, sorgente su
+  [tombadilo-bombadilo/budgero](https://github.com/tombadilo-bombadilo/budgero).
+  Self-host gratuito, feature set completo, nessuna license key. L'immagine
+  che questo wrapper ridistribuisce non è modificata: ci si aggiunge solo un
+  entrypoint, quindi non scatta l'obbligo AGPL di pubblicare un sorgente
+  modificato — e il codice del wrapper è comunque pubblico qui.

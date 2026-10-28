@@ -32,14 +32,20 @@ services:
       # pulita resterebbe senza admin.
       - BUDGERO_ADMIN_USER=admin
       - BUDGERO_ADMIN_NAME=Admin
-      # Fix PSU-IP: il reverse-proxy/tunnel Lazycat non porta l'IP pubblico
-      # reale fino al container, RealIP() risolve un hop privato (172.28.x)
-      # e il bank-sync (Enable Banking) viene rifiutato ("PSU header not
-      # provided"). DDNS perché la linea di casa cambia IP ogni 24h — viene
-      # risolto live ad ogni richiesta ticket, non cachato.
-      - SELF_HOST_PUBLIC_IP=di369a4.glddns.com
       # v1.12.x: il server fa CheckOrigin sull'upgrade WebSocket e di default
-      # ammette solo localhost — senza questa variabile la web-app da
-      # budgero.federicoliva.it resta "Offline" (sync WS rifiutato 403 CORS).
-      - WEBSOCKET_ALLOWED_ORIGINS=https://budgero.federicoliva.it,https://budgero.chronos.heiyu.space
+      # ammette solo localhost — senza questa variabile la web-app resta
+      # "Offline" (sync WS rifiutato 403 CORS). LAZYCAT_APP_DOMAIN è il
+      # dominio che il box assegna a QUESTA app: inchiodare un dominio qui
+      # romperebbe ogni altro box. Chi espone l'app anche da un dominio
+      # proprio (tunnel Cloudflare, reverse proxy) lo aggiunge in coda:
+      #   WEBSOCKET_ALLOWED_ORIGINS=https://${LAZYCAT_APP_DOMAIN},https://budgero.esempio.it
+      - WEBSOCKET_ALLOWED_ORIGINS=https://${LAZYCAT_APP_DOMAIN}
+      # Fix PSU-IP, serve SOLO al bank-sync (Enable Banking): il
+      # reverse-proxy/tunnel Lazycat non porta l'IP pubblico reale fino al
+      # container, RealIP() risolve un hop privato (172.28.x) e la richiesta
+      # viene rifiutata con "PSU header not provided". Va riempita col
+      # proprio IP pubblico o con un hostname DDNS (risolto live ad ogni
+      # richiesta ticket, non cachato) — su una linea domestica l'IP cambia.
+      # Vuota = bank-sync non funzionante, tutto il resto sì.
+      # - SELF_HOST_PUBLIC_IP=mio-ddns.esempio.com
       # - CURRENCYLAYER_API_KEY=  # opzionale, abilita multi-currency rates

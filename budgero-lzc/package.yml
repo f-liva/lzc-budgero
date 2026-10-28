@@ -1,6 +1,6 @@
 lzc-sdk-version: '0.1'
 package: cloud.lazycat.app.budgero
-version: 1.0.18
+version: 1.0.19
 name: Budgero
 description: Manual-first private budgeting (self-hosted). No bank connections.
 author: Federico Liva
