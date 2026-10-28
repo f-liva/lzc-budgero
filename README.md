@@ -47,16 +47,26 @@ lzc-cli appstore copy-image fliva/lzc-budgero:1.0.0
 # output: registry.lazycat.cloud/u30562882/fliva/lzc-budgero@sha256:DIGEST
 ```
 
+`copy-image` va lanciato dalla **lzc-cli di Windows**: il login allo
+appstore vive in quella, non in quella di WSL. Da WSL serve il path assoluto,
+`powershell.exe` non è nel PATH:
+
+```bash
+/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile \
+  -Command "lzc-cli appstore copy-image fliva/lzc-budgero:1.0.18"
+```
+
 ### 3. Aggiorna `image:` in `budgero-lzc/lzc-manifest.yml`
 
-Sostituisci `REPLACE_AT_BUILD` con il digest restituito.
+Sostituisci con il digest `registry.lazycat.cloud/...` restituito. Lo store
+rifiuta un `image:` che non punti a quel registry; per il solo deploy privato
+`docker.io/...` basta.
 
-### 4. Configura admin password (PRIMA del build .lpk)
+### 4. Bump `version:` in `budgero-lzc/package.yml`
 
-In `budgero-lzc/lzc-manifest.yml` modifica:
-```yaml
-- BUDGERO_ADMIN_PASS=la-tua-password-sicura
-```
+Dal layout LPK v2 i campi statici (`package`, `version`, `name`,
+`description`, `author`, `homepage`, `locales`) stanno in `package.yml`, non
+nel manifest. Senza bump l'install può silenziosamente non fare nulla.
 
 ### 5. Build `.lpk`
 
@@ -65,14 +75,40 @@ cd budgero-lzc/
 ./install.sh
 ```
 
-### 6. Install da PowerShell (Windows)
+### 6. Install sul NAS via lpk-manager (SSH)
 
-`lzc-cli` da WSL non raggiunge il NAS (vedi `lzc-openfang` README). Install da Windows:
+`lzc-cli app install` da WSL fallisce con `ENETUNREACH` (rete Lazycat, IPv6).
+La strada che funziona è `lpk-manager` sul NAS via SSH — la chiave è già
+installata per `root@192.168.8.115`:
+
+```bash
+scp cloud.lazycat.app.budgero-v1.0.18.lpk root@192.168.8.115:/tmp/
+ssh root@192.168.8.115 '/lzcsys/bin/lpk-manager install /tmp/cloud.lazycat.app.budgero-v1.0.18.lpk'
+ssh root@192.168.8.115 '/lzcsys/bin/lpk-manager start cloud.lazycat.app.budgero'
+```
+
+Alternativa (install da PowerShell, se il NAS non è sulla LAN):
 
 ```powershell
-cp cloud.lazycat.app.budgero-v1.0.0.lpk /mnt/c/Users/fede9/Desktop/
-lzc-cli app install C:\Users\fede9\Desktop\cloud.lazycat.app.budgero-v1.0.0.lpk
+cp cloud.lazycat.app.budgero-v1.0.18.lpk /mnt/c/Users/fede9/Desktop/
+lzc-cli app install C:\Users\fede9\Desktop\cloud.lazycat.app.budgero-v1.0.18.lpk
 ```
+
+### 7. Backup PRIMA di ogni upgrade che attraversa la v1.19.0
+
+La v1.19.0 migra il DB in avanti e **senza ritorno**: dopo l'update i device
+non possono tornare alla 1.18 se non ripristinando un backup del volume.
+
+```bash
+ssh root@192.168.8.115 '/lzcsys/bin/lpk-manager stop cloud.lazycat.app.budgero'
+ssh root@192.168.8.115 'mkdir -p /lzcsys/var/backups && tar czf /lzcsys/var/backups/budgero-data-$(date +%Y%m%d-%H%M%S).tar.gz \
+  -C /lzcsys/data/appvar/cloud.lazycat.app.budgero data'
+```
+
+`/lzcsys/var` sopravvive al reboot, `/` no (vedi `/AGENTS.md` sul NAS). Il
+container non ha `sqlite3`, quindi si ferma l'app e si copia il volume —
+niente `.backup` a caldo. Dopo l'update va **ricaricata la web-app su ogni
+device**: una versione vecchia si ferma con "Update required".
 
 ## Configurazione
 
@@ -83,7 +119,8 @@ lzc-cli app install C:\Users\fede9\Desktop\cloud.lazycat.app.budgero-v1.0.0.lpk
 | `SELF_HOSTABLE` | `true` | Richiesto da Budgero in self-host |
 | `SELF_HOST_JWT_TTL_HOURS` | `720` | Sessione 30 giorni |
 | `BUDGERO_ADMIN_USER` | `admin` | Username admin bootstrap |
-| `BUDGERO_ADMIN_PASS` | `changeme-on-first-login` | **CAMBIA prima dell'install** |
+| `BUDGERO_ADMIN_PASS` | (unset) | Se vuota, l'entrypoint genera una random e la scrive in `/data/admin.pass` + nei log |
+| `BUDGERO_ADMIN_FORCE_RESET` | (unset) | `true` resetta la password dell'utente esistente ad ogni avvio |
 | `BUDGERO_ADMIN_NAME` | `Admin` | Display name |
 | `CURRENCYLAYER_API_KEY` | (unset) | Opzionale, abilita multi-currency |
 | `SELF_HOST_JWT_SECRET` | auto da `/data/jwt.secret` | Non settare manualmente |
@@ -99,6 +136,31 @@ Budgero non supporta header SSO (`X-Remote-User`, `X-Forwarded-User`, OIDC trust
 
 Workaround attuale: bootstrap admin via env vars al primo avvio. Niente da fare se non aspettare che upstream supporti header auth.
 
+### Policy password da v1.19.x
+
+Il server rifiuta una password senza maiuscola, minuscola e cifra:
+
+```
+Error: failed to reset password: password must contain uppercase, lowercase, and digit
+```
+
+Il vecchio default `changeme-on-first-login` cadeva esattamente lì. Due
+conseguenze, entrambe sanate nell'entrypoint:
+
+- su un'install **pulita** `create-user` fallisce e l'app resta senza admin;
+- su un'install **esistente** il reset ad ogni avvio fallisce in silenzio
+  (`|| echo`), mascherando il fatto che la password nel manifest non è mai
+  stata quella in uso.
+
+Ora l'entrypoint non tocca la password di un utente che esiste già (serve
+`BUDGERO_ADMIN_FORCE_RESET=true`), e al bootstrap genera una random conforme
+per costruzione se `BUDGERO_ADMIN_PASS` è vuota. I test stanno in
+`docker/tests/entrypoint.test.sh`:
+
+```bash
+bash docker/tests/entrypoint.test.sh
+```
+
 ### Closed-source binary
 
 Budgero non ha repo pubblico. Il wrapper può solo:
@@ -108,9 +170,12 @@ Budgero non ha repo pubblico. Il wrapper può solo:
 
 Patch del comportamento upstream impossibili. Ad ogni release upstream → re-build wrapper image.
 
-### `latest` mutabile upstream
+### Tag upstream pinnato, non per digest
 
-`FROM budgero/budgero:latest` non è pinnato per digest. Future release v1.x: pin `FROM budgero/budgero@sha256:...` per riproducibilità totale.
+Il `Dockerfile` pinna un tag esplicito (`FROM budgero/budgero:v1.19.5`), mai
+`:latest` — un upgrade implicito ha già rotto i push (pre-v2) e il sync WS
+(`CheckOrigin` in v1.12.x). Il tag resta comunque mutabile a monte: per
+riproducibilità totale servirebbe `@sha256:...`.
 
 ## Comandi utili
 
@@ -134,10 +199,13 @@ lzc-cli app uninstall cloud.lazycat.app.budgero
 ```
 lzc-budgero/
 ├── docker/
-│   ├── Dockerfile          # FROM budgero/budgero:latest + entrypoint
-│   └── entrypoint.sh       # JWT + admin bootstrap idempotente
+│   ├── Dockerfile          # FROM budgero/budgero:<tag pinnato> + entrypoint
+│   ├── entrypoint.sh       # JWT + admin bootstrap idempotente
+│   └── tests/
+│       └── entrypoint.test.sh  # self-check dei rami admin (bash, no framework)
 ├── budgero-lzc/
-│   ├── lzc-manifest.yml    # manifest LCMD
+│   ├── package.yml         # campi statici del pacchetto (LPK v2)
+│   ├── lzc-manifest.yml    # manifest LCMD (routes, services, env)
 │   ├── lzc-build.yml       # config build (pkgout, icon)
 │   ├── icon.png            # 144×144 (da budgero.app/logo_144.png)
 │   └── install.sh          # build .lpk + hint install
