@@ -53,12 +53,14 @@ appstore vive in quella, non in quella di WSL. Da WSL serve il path assoluto,
 
 ```bash
 /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile \
-  -Command "lzc-cli appstore copy-image fliva/lzc-budgero:1.0.18"
+  -Command "lzc-cli appstore copy-image fliva/lzc-budgero:1.0.20"
 ```
 
 ### 3. Aggiorna `image:` in `budgero-lzc/lzc-manifest.yml`
 
-Sostituisci con il digest `registry.lazycat.cloud/...` restituito. Lo store
+Sostituisci con il riferimento `registry.lazycat.cloud/...` restituito, così
+com'è: fino alla 1.0.19 era un `@sha256:` digest, dalla 1.0.20 `copy-image`
+stampa un tag (`:172efac4e586c676`). Lo store
 rifiuta un `image:` che non punti a quel registry; per il solo deploy privato
 `docker.io/...` basta.
 
@@ -98,16 +100,16 @@ La strada che funziona è `lpk-manager` sul NAS via SSH — la chiave è già
 installata per `root@192.168.8.115`:
 
 ```bash
-scp cloud.lazycat.app.budgero-v1.0.18.lpk root@192.168.8.115:/tmp/
-ssh root@192.168.8.115 '/lzcsys/bin/lpk-manager install /tmp/cloud.lazycat.app.budgero-v1.0.18.lpk'
+scp cloud.lazycat.app.budgero-v1.0.20.lpk root@192.168.8.115:/tmp/
+ssh root@192.168.8.115 '/lzcsys/bin/lpk-manager install /tmp/cloud.lazycat.app.budgero-v1.0.20.lpk'
 ssh root@192.168.8.115 '/lzcsys/bin/lpk-manager start cloud.lazycat.app.budgero'
 ```
 
 Alternativa (install da PowerShell, se il NAS non è sulla LAN):
 
 ```powershell
-cp cloud.lazycat.app.budgero-v1.0.18.lpk /mnt/c/Users/fede9/Desktop/
-lzc-cli app install C:\Users\fede9\Desktop\cloud.lazycat.app.budgero-v1.0.18.lpk
+cp cloud.lazycat.app.budgero-v1.0.20.lpk /mnt/c/Users/fede9/Desktop/
+lzc-cli app install C:\Users\fede9\Desktop\cloud.lazycat.app.budgero-v1.0.20.lpk
 ```
 
 ### 7. Backup PRIMA di ogni upgrade che attraversa la v1.19.0
@@ -124,7 +126,8 @@ ssh root@192.168.8.115 'mkdir -p /lzcsys/var/backups && tar czf /lzcsys/var/back
 `/lzcsys/var` sopravvive al reboot, `/` no (vedi `/AGENTS.md` sul NAS). Il
 container non ha `sqlite3`, quindi si ferma l'app e si copia il volume —
 niente `.backup` a caldo. Dopo l'update va **ricaricata la web-app su ogni
-device**: una versione vecchia si ferma con "Update required".
+device**: una versione vecchia si ferma con "Update required". Dalla v1.21.0
+un device rimasto alla 1.20 sospende il sync finché non viene aggiornato.
 
 ## Configurazione
 
@@ -202,7 +205,7 @@ release upstream → re-build dell'immagine wrapper.
 
 ### Tag upstream pinnato, non per digest
 
-Il `Dockerfile` pinna un tag esplicito (`FROM budgero/budgero:v1.19.5`), mai
+Il `Dockerfile` pinna un tag esplicito (`FROM budgero/budgero:v1.21.5`), mai
 `:latest` — un upgrade implicito ha già rotto i push (pre-v2) e il sync WS
 (`CheckOrigin` in v1.12.x). Il tag resta comunque mutabile a monte: per
 riproducibilità totale servirebbe `@sha256:...`.
