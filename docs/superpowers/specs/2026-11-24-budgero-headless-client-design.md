@@ -309,7 +309,7 @@ the file chains, exit **143**.
    If the latch closes while `draining`, exit **75** wins. Because the first failure is
    persisted (`failures.json`, U3), the `queuedAtRestore > 0` exit does not lose the retry
    count: the next start quarantines on the next failure.
-   or the startup drain follow the same row (exit 77 only when `queuedAtRestore > 0`).
+   Restores during `bootstrapping` or the startup drain follow the same row (exit 77 only when `queuedAtRestore > 0`).
 5. **Live ordering check, per request.** Gate (8.1) read under the apply-phase lock:
    `base = max(cursor, highest version among own acks)` (the ack handler calls
    `onMutationAck` before `updateLocalVersion`, so the cursor can lag one own ack). The
