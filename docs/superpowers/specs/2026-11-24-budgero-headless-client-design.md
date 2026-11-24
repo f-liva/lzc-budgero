@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: **v23**, after twenty-two adversarial review rounds (44 reviewers; every critical/important finding verified in code at the pin).
+Date: 24/11/2026. Status: **v24**, after twenty-three adversarial review rounds (46 reviewers; every critical/important finding verified in code at the pin).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet).
 Pin: upstream tag **v1.22.1 = `e40723e`**. `file:line` references are at that pin, relative to
 `packages/` of the Budgero monorepo unless another repo is named.
@@ -148,7 +148,8 @@ migrations and catch-up correctly. Running continuous rules was rejected in v15 
   | `onMutationNacked(id, code)` | `handleMutationNack`, `sync-transport.ts:979` | no | 8.2 |
   | `onRemoteApplyFailed(mutation, error, path, precedingVersion)` | both apply catch blocks after the `isUpdateRequiredError` branch (`:1099-1107` live, `:1219-1244` catch-up), before cursor move; on return the **live** path also records `catchUpApplyFailures[key] = {version, precedingVersion: localVersion}` and runs `handleCatchUpUnsafe('apply_failed')` (only when the hook is provided; the web app is unchanged) | yes | persist `{key, version, precedingVersion}` to `failures.json` so the first failure survives an exit (8.4) |
   | `onQuarantined(mutation, error)` | `quarantineCatchUpMutation`, `sync-transport.ts:1397-1419`; key = `id || 'version:' + version` as `catchUpFailureKey` (`:1393-1395`) | no | 8.4 (idempotent per key) |
-  | `skipMutationKeys(): ReadonlySet<string>` | in **both transport loops before `decodeMutationPayload`** (`sync-transport.ts:1080-1089` live, `:1210-1212` catch-up; a decode/normalise failure throws before `onRemoteMutation` is reached, `:1117-1137`), keyed `catchUpFailureKey(m)` (`:1393-1395`); a hit skips and advances the cursor as quarantine does (`:1414`) | sync | keys from `quarantine.json` not `covered` (8.4); never touched by `resetForRestore` |
+  | `skipMutationKeys(): ReadonlySet<string>` | in **both transport loops before `decodeMutationPayload`** (`sync-transport.ts:1080-1089` live, `:1210-1212` catch-up; a decode/normalise failure throws before `onRemoteMutation` is reached, `:1117-1137`), keyed `catchUpFailureKey(m)` (`:1393-1395`; on the **live** path the frame carries `msg.mutationId`, not `msg.id`, `types/messages.ts:8, 22`, so the key is built from `{id: msg.mutationId, version: msg.version}` and the same normalised pair is passed to every hook); a hit skips and advances the cursor as quarantine does (`:1414`) | sync | keys from `quarantine.json` not `covered` (8.4); never touched by `resetForRestore` |
+  | `onRemoteApplySucceeded(key)` | catch-up success next to the in-memory delete (`sync-transport.ts:1215`) and the live success path | sync | remove the key from `failures.json` |
   | `seedCatchUpFailures(): Map` | transport construction, into `catchUpApplyFailures` (`:194`) | sync | entries of `failures.json`, so a mutation that failed once before an exit is quarantined on its next failure instead of restored again; the live path (U3 addition) also consults the map, so a persisted failure quarantines on a live retry too |
   | `beforeRestore({reason})` | `downloadAndRestore` after `download()` returned non-null, before `db.restore()` (`database-sync.ts:427-433`); `reason` threaded from its callers: `onCatchUpUnsafe` (`runtime-context-factory.ts:251-259`), out-of-band `downloadLatest` (`runtime-coordinator.ts:640-650`) | yes | restore table (7.5.4) |
   | `settledAfterRestore(): Promise<void>` | resolved by the transport when the catch-up started on the connection opened after a restore has settled (`initialCatchUpSettled` is one-shot, `sync-transport.ts:1589-1591`, so a per-connection signal is added) | — | leaves `draining` |
@@ -181,8 +182,11 @@ promise chain per file, content snapshotted at call time.
 ### 7.2 Platform pieces (`packages/headless/src/platform`)
 
 - `storage.ts`: in-memory `localStorage` shim, reset at each start.
-- `database.ts`: bare `NodeSqlJsAdapter`, failure logs redacted; no `forceSave`, so the
-  runtime never persists cursor/applied ids (intended).
+- `database.ts`: `NodeSqlJsAdapter` with a **no-op `forceSave`** (so `persistDatabase` returns
+  true: without it `onCatchUpUnsafe` throws "Failed to persist local database after catch-up
+  recovery", `runtime-context-factory.ts:290-293`, and for a legacy blob with no bound the
+  cursor would never be reseeded, `sync-transport.ts:1516-1551`); what it "persists" goes to
+  the in-memory shim only. Failure logs redacted.
 - `queue-storage.ts`: `QueueStorage` over `outbox.json`. The wrapper **observes** the queue
   it is handed on every save: ids that appear → ledger `queued` (full entry stored); ids that
   disappear → **dequeue**. A dequeue is an ack unless the wrapper itself caused it (admin
@@ -276,11 +280,14 @@ reason}`, no bearer) only, except on 143 where it exits too.
    `bootstrap_retries_exhausted` (7.6). A **server** failure ⇒
    halt `bootstrap_failed:download` at once.
 
-10. In `onSpaceActivated` with `ok && path === 'server_snapshot'`, **synchronously** (before
+10. In `onSpaceActivated` with `ok` and path `server_snapshot` **or `fresh`** (on `fresh` `bound`
+    is undefined: nothing covered, nothing pruned), **synchronously** (before
     yielding; `connect()` returns before `onopen`, `sync-transport.ts:370-470`, so no catch-up
     page can overwrite the key first): read `bound` from the shim key, recompute `covered` for
     every quarantine entry (8.4), prune `failures.json` entries with `version ≤ bound`, then
-    open the gate. Until then every entry counts as uncovered.
+    open the quarantine part of the 8.1 gate (reads open on the accepted report). Until then
+    every entry counts as uncovered: step 4 loads entries with `covered` forced to false and
+    `skipMutationKeys()` reads live state.
 
 `exit-info` is written on **every** worker-initiated exit (1 included) and cleared first thing
 at step 1, so the supervisor never serves a stale reason.
@@ -313,7 +320,7 @@ the file chains, exit **143**.
    |---|---|---|---|
    | blob check on reconnect (7.2) | WS shim; upstream downloads nothing | no restore: `draining` → exit **77** when the lock is free; leftovers drain next start | `rebuilds.log` 77, budget 50/24 h → `restore_storm` |
    | out-of-band `sync_state_changed` frame | WS shim (`draining` at once) + `beforeRestore({reason:'out_of_band'})` | exit **77** when the lock is free | same |
-   | catch-up-unsafe fallback (`apply_failed`, gap, bad page) | `beforeRestore({reason:'catchup_unsafe'})` | **completes in-process** (upstream quarantines a mutation only on its **second** failure at the same `precedingVersion`, `sync-transport.ts:194, 1231-1244`; exiting on the first would loop). `draining` until `settledAfterRestore()`; then **exit 77 iff `queuedAtRestore > 0`** (the reapplied outbox put the DB out of order), else back to `priorState` (`live`, `bootstrapping` or the startup `draining`): a restore with an empty queue is snapshot + log in server order whatever the state; a `beforeRestore` with no `reason` (other callers, `database-sync.ts:259`, `runtime-coordinator.ts:701`, unreachable here) follows the out-of-band row | `halts.log` `restore_inproc`; `/v1/status.restores_inproc_24h`; > 50 in 24 h (from `halts.log`, survives restarts) ⇒ halt `restore_loop`; recovery failure (`syncDisabled`, `SnapshotUnavailableError`, `:1538-1550`) ⇒ halt `restore_failed` |
+   | catch-up-unsafe fallback (`apply_failed`, gap, bad page) | `beforeRestore({reason:'catchup_unsafe'})` | **completes in-process** (upstream quarantines a mutation only on its **second** failure at the same `precedingVersion`, `sync-transport.ts:194, 1231-1244`; exiting on the first would loop). `draining` until `settledAfterRestore()`; then **exit 77 iff `queuedAtRestore > 0`** (the reapplied outbox put the DB out of order), else back to `priorState` (`live`, `bootstrapping` or the startup `draining`): a restore with an empty queue is snapshot + log in server order whatever the state; a `beforeRestore` with no `reason` (other callers, `database-sync.ts:259`, `runtime-coordinator.ts:701`, unreachable here) follows the out-of-band row | `halts.log` `restore_inproc`; `/v1/status.restores_inproc_24h`; > 50 in 24 h (from `halts.log`, survives restarts) ⇒ halt `restore_loop`; recovery failure (`syncDisabled`, `SnapshotUnavailableError`, `:1538-1550`, observed through the sync-status listener as `syncError.code === 'snapshot_unavailable'`, `:642-650`) ⇒ halt `restore_failed` |
 
    If the latch closes while `draining`, exit **75** wins. Because the first failure is
    persisted (`failures.json`, U3), the `queuedAtRestore > 0` exit does not lose the retry
@@ -371,8 +378,9 @@ path (75, 76, 77, 78, 143) and `beforeRestore` wait for it.
 
 **Rebuild**: wait for the apply-phase lock → (76 only: wait for dequeues of landed ops, 30
 s) → **answer any request still in step 5 at once** (200 `reordered` if a verdict landed; on a 76, 200
-`partial` only when ops 1..i-1 have dequeued, else 202 `pending` with per-op states incl.
-`failed`/`skipped`; never 200 for an op the server has not acked) → `halt()` → wait for **all** file chains (outbox, ledger, quarantine, failures, halts) → write
+`partial` only when ops 1..i-1 have dequeued; on 77 or a drop, and otherwise, 202 `pending`
+with per-op states incl. `failed`/`skipped`; never 200 for an op the server has not acked; a
+`reordered` verdict landing during a 76 wait ⇒ 75 wins) → `halt()` → wait for **all** file chains (outbox, ledger, quarantine, failures, halts) → write
 `exit-info {reason, outbox_size, uptime_s}` → `process.exit(<code>)`. The global write lock is held
 from the triggering request until exit. In-process re-activation is not used (re-activating
 the same space keeps the old transport alive, `runtime-lifecycle-service.ts:176-179`).
@@ -509,8 +517,9 @@ A quarantine is **not forever**:
   is undefined at that point because the bootstrap download bypasses `dbSync`). The shim falls
   back to the server head for a legacy blob with no `mutation_version`
   (`space-activation-service.ts:289-292`), so `http.ts` records whether the blob response
-  carried `mutation_version` (`api-client.ts:375-377`); if not, `bound` is undefined ⇒ never
-  covered (relevant at the NAS upgrade: the last blob may come from a pre-1.22 client). A covered entry leaves `skipMutationKeys()` and the gate: catch-up starts after
+  carried an **`X-Mutation-Version` header** (`snapshot-download.ts:41-47`, sent only when the
+  server has a bound, `handler/sync.go:126-128`; tested with `headers.has`, `0` is valid); if
+  not, `bound` is undefined ⇒ never covered (relevant at the NAS upgrade: the last blob may come from a pre-1.22 client). A covered entry leaves `skipMutationKeys()` and the gate: catch-up starts after
   `bound`, so the mutation is never replayed, and whatever the snapshot holds came from a peer.
   It can go back to false (a history restore may publish an older bound, `blob_history.go:360-363,
   426`), and `onQuarantined` on an existing key resets `covered` to false;
@@ -521,6 +530,16 @@ A quarantine is **not forever**:
   (e.g. an FX fetch that failed during apply, `core/.../transactions/index.ts:1208-1216`):
   removes the entry and exits 77; the next start replays the mutation, and a second failure
   quarantines it again.
+
+**Tainted entries.** While reapplied outbox entries precede catch-up (startup outbox non-empty,
+or `queuedAtRestore > 0`), our own ops run locally before peer mutations the server ordered
+earlier, so a peer mutation can fail **here only** (e.g. a peer `updateColumn` on a row our
+queued delete already removed, `core/.../transactions/index.ts:958-962`) and be quarantined
+in-process (the ack that would end the drain sits behind the restore in the receive chain,
+`sync-transport.ts:427-430`). Failures and quarantines recorded in that condition are marked
+`tainted: true`, never served to `skipMutationKeys()`, never block writes beyond the drain,
+and are **dropped at step 4 of the next start whose outbox is empty**: the clean bootstrap
+judges the mutation again (a genuine failure fails twice and is quarantined untainted).
 
 `failures.json` lifecycle: an entry is removed when its key applies (U3
 `onRemoteApplySucceeded(key)` next to the in-memory delete, `sync-transport.ts:1214-1215`) or is
@@ -678,8 +697,8 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
    a forced in-process restore ⇒ no new entry, mutation skipped; a peer snapshot bound past
    it ⇒ `covered` on the next start, an older history restore ⇒ uncovered again; `retry` ⇒
    exit 77, replay, re-quarantine; a quarantine caused by a **corrupted `encryptedPayload`**
-   is skipped before decode at the next start; a failure met during the startup drain
-   (`queuedAtRestore > 0`) ⇒ exit 77 and quarantine at the next start's failure; 51 forced in-process
+   is skipped before decode at the next start; a peer edit of a row our queued delete removed, met during the startup drain ⇒ quarantined
+   **tainted** in-process, exit 77, dropped at the next clean start, applied normally there; 51 forced in-process
    restores ⇒ halt `restore_loop`; unknown op code ⇒ halt `unknown_op`; header,
    WS URL and frame tests; proxy saw **only** allowlisted calls (login, `GET /profile`, `GET
    /budget-spaces`, `HEAD /health`, `GET /database/blob`, `GET /database/state`, `GET
@@ -736,7 +755,8 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
   absolute value at the same instant; identical in the web app.
 - Rebuild frequency: one per restore (reconnect that finds a newer blob, out-of-band
   upload), reordered write, failed write. `rebuilds_24h`/`restores_24h` show if the budgets are wrong.
-- Availability: a halt or storm is 503 until the operator acts.
+- Availability: a halt or storm is 503 until the operator acts; `covered` is recomputed only at
+  start, so a quarantine covered by an in-process restore unblocks writes at the next restart.
 - Upstream churn: pin to a tag; server and headless upgrade together; U1–U4, U6 carried as a
   patch stack until upstream takes them (#155).
 
