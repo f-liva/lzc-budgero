@@ -1,7 +1,7 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: draft v2, after review round 1 (two adversarial reviewers, 7
-critical + 10 important findings, all verified in code and folded in below).
+Date: 24/11/2026. Status: draft v3, after review rounds 1 and 2 (four adversarial
+reviewers; every critical/important finding verified in code and folded in below).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet; we start anyway).
 Code references are to upstream master `e40723e` (v1.22.1 + v1.22.2 release merge).
 
@@ -123,81 +123,117 @@ injection points upstream (U1–U4).
 - **U1 — external space key.** `RuntimeCoordinatorDeps.spaceKeySource?: { spaceId, key }`.
   When set: the coordinator's `KeyVault` returns that key for that space and throws for
   any other; never unwraps, never generates, never uploads a key (`uploadEncryptedKey`
-  unused); lifecycle doesn't require the master password; local persistence cipher is
-  disabled (plaintext at rest, see Security); `ensureSpaceKeys` runs only for that space
-  and activation targets it instead of `primary_space_id`.
+  never passed); lifecycle doesn't require the master password and the local persistence
+  cipher is disabled in **all three** lifecycle sites (`runtime-lifecycle-service.ts:64, 94,
+  183`); `ensureSpaceKeys` runs only for that space and activation targets it instead of
+  `primary_space_id`.
 - **U2 — injected queue storage.** `runtime-context-factory.ts:201` passes a
   `QueueStorage` from deps to `new OfflineQueue(spaceId, storage)` (constructor already
   accepts it, `offline-queue.ts:56`).
-- **U3 — upload veto.** `canUploadSnapshot?: () => boolean` in deps, checked by
-  `DatabaseSync` before every upload (incl. out-of-band); and a `onMutationQuarantined`
-  callback.
-- **U4 — 409 restore = full restore.** `DatabaseSync`'s conflict restore goes through the
-  same post-restore path as the coordinator (migrations + `reconcileSpaceScope` +
+- **U3 — halt and veto hooks.**
+  - `uploadVeto?: () => boolean`, ANDed with the existing `DatabaseSyncDeps.canUploadSnapshot`
+    (catch-up guard, `runtime-context-factory.ts:173-174`), checked inside `doUpload`
+    right before `uploadBlob` and before `downloadAndRestore` in the 409 branch
+    (`database-sync.ts:196-199, 246, 259-279`), so out-of-band and retry uploads are covered.
+  - `onRemoteApplyFailed?(mutation, error)`, called at the top of both catch blocks
+    (catch-up `sync-transport.ts:1226-1244`, live `:1097-1107`) **before** any cursor move,
+    quarantine or snapshot fallback, routing into the existing `haltForUpdate` path.
+  - `RuntimeCoordinator.halt(reason)`: stops sync, reconnection and connectivity, clears
+    the coordinator timers (`remoteBlobRetryTimer`, `runtime-coordinator.ts:635-638`),
+    makes `upload` and `downloadAndRestore` no-ops behind a halted flag, **flushes** local
+    persistence instead of disposing it, keeps the DB open for reads.
+- **U4 — 409 restore = full restore.** `DatabaseSync` gets a post-restore dependency so the
+  conflict restore runs the coordinator's path (migrations + `reconcileSpaceScope` +
   `requestCatchUp`).
 - **U5 — atomic push claim** (server): `UPDATE push_queue SET status='processing' WHERE
   id=? AND status='pending'`, rows affected = 1, plus the app using it. Prerequisite for
   any future headless push processing; not built in this project.
+- **U6 — shared mutation pipeline.** Move `executeMutation`'s pure parts out of
+  `AppRuntime` (`app-runtime.ts:72-82, 136-151, 232-270, 760-904, 906-1155`: prepare,
+  continuous-rules post-hook, `recordHistory`, `resolveHistoryBudgetId`) into a module
+  without analytics/toast imports, used by both `AppRuntime` and the headless. No copy of
+  app logic lives in `packages/headless`.
 
 ### Platform pieces (packages/headless/src/platform)
 
-- `state-store.ts` — **one durable container** for DB + key/value state. The localStorage
-  shim buffers `setItem` in memory; the buffer is committed atomically **together with**
-  the next DB persist (write temp dir with `space.sqlite` + `storage.json`, fsync files,
-  rename over the live dir, fsync parent). State can therefore never lead the DB.
-  `getItem` reads the buffered value.
-- `database.ts` — `createDatabase()` = `NodeSqlJsAdapter` wrapped with `forceSave()` (calls
-  `state-store.commit()`, resolves after fsync) and a `restore()` that commits before
-  returning, like the web adapter. This makes `persistDatabase` return `true`, enabling the
-  runtime's own cursor/applied-id ordering.
-- `queue-storage.ts` — file-backed `QueueStorage` (U2); `save` resolves after fsync.
+- `state-store.ts` — **DB generations paired with write-through state.**
+  - DB files `db.<g>`: every `forceSave`, `create(data)`, `restore`, `restoreAndMigrate`
+    writes `db.<g+1>` (temp file, fsync, rename, fsync dir) from `adapter.backup()` (not raw
+    `export()`, so `createFunction` registrations come back).
+  - `storage.json` holds every localStorage key **and the outbox**, stamped with the latest
+    committed generation. The localStorage shim writes through synchronously on every
+    `setItem` (`writeFileSync` temp + `fsyncSync` + rename), exactly the guarantee the
+    runtime assumes (`local-persist-scheduler.ts:20-37`).
+  - Startup opens the generation the `storage.json` stamp names; older generations are
+    deleted only after a newer stamp is on disk. A crash at any point therefore pairs a DB
+    with exactly the state written after it (~9 MB disk).
+  - Startup outbox reconciliation, before sync connects: queued ids absent from the
+    persisted applied set are not in the DB (the applied flush follows the persist that
+    contains them), so they are re-applied locally **from their stored prepared args**
+    (no re-prepare), then marked applied; ids present are already in the DB.
+- `database.ts` — `createDatabase()` = `NodeSqlJsAdapter` wrapped as above, so
+  `persistDatabase` returns `true` and the runtime's own ordering is active. sql.js wasm
+  resolved by explicit path (the adapter defaults to `process.cwd()/node_modules`).
+- `queue-storage.ts` — `QueueStorage` (U2) backed by the outbox section of `storage.json`;
+  reuses `deserializeMutation` (`offline-queue/storage.ts:40`).
 - `http.ts` — port of the app's `blobApi` / `spacesApi` (no Clerk/zustand/env): every
   header the app sends (`X-Data-Format-Version`, `X-Budgero-Protocol`,
   `X-Database-Version`, `X-Encryption-Key-Version`, `X-Mutation-Version`, optional
   `X-Out-Of-Band`, `X-Client-Session`, bearer); `downloadBlob` null only on 404; 409 errors
-  expose `status` and `response.error` for `getConflictDetails`. Base URL also for the
-  core's relative FX path. A contract test asserts headers against the app's
-  `api-client.ts` at the pinned tag.
+  expose `status` and `response.error` for `getConflictDetails`; `getDatabaseState` and
+  `hasLocalDatabase` provided (without them every start downloads a snapshot,
+  `space-activation-service.ts:454-457`). Base URL also for core's relative FX path.
+  Contract test against the app's `api-client.ts` at the pinned tag.
 - `websocket.ts` — `globalThis.WebSocket` shim (`ws` package) sending
-  `Origin: <BUDGERO_ORIGIN>`; `getWebSocketUrl` builds `token`, `space_id`,
-  `protocol=SYNC_PROTOCOL_VERSION`, `client_session` (same id as HTTP). Test asserts the URL.
+  `Origin: <origin>`; `getWebSocketUrl` builds `token`, `space_id`,
+  `protocol=SYNC_PROTOCOL_VERSION`, `client_session` (same id as HTTP). In read-only mode
+  it enforces an **outbound frame allowlist** (`catch_up_request`, pings) and throws on
+  any other `type`. Tests assert URL and allowlist.
 - `global.ts` — replacement for `@shared/runtime/global` exposing **full**
   `services()`, `mutationsRouter()` and the `mutationHistory` id-reuse API; startup fails if
   any is missing (prevents `withLegacyFormat` silently downgrading formats).
 - `lingui.ts` — stub for `@lingui/core/macro` (`t`/`msg` → interpolated English source).
-- Logging: core/runtime logs routed through a redactor (no args/params, no tokens); the
+- Logging: core/runtime logs through a redactor (no args/params, no tokens); the
   `NodeSqlJsAdapter` failure logs (params) are redacted.
 
 ### Client pieces (packages/headless/src/client)
 
 - `auth.ts` — `POST /api/v1/auth/local/login`; re-login before expiry and on 401.
-- `runtime.ts` — stock `RuntimeCoordinator` with U1–U4 deps: `spaceKeySource`, queue
-  storage, `canUploadSnapshot`, quarantine callback, `getWebSocketUrl`, `reloadApp` and
-  key/password-change callbacks wired to Halting. Bootstrap (snapshot vs catch-up) is the
-  coordinator's own activation path; we never seed the cursor by hand.
-- `execute.ts` — port of `AppRuntime.executeMutation`: `prepareMutationArgs` → coordinator
-  `executeMutation` → continuous-rules post-hook; plus `recordHistory` and
-  `resolveHistoryBudgetId` (`app-runtime.ts:131-151, 906-1155`), so `mutation_history` in
-  our snapshots matches the app's.
-- `idempotency.ts` — REST `Idempotency-Key` → mutation id `hdl_<sha256(key)>`; before
-  executing, check `isMutationApplied`/outbox; on a hit return the stored result. The
-  key→result map lives in `storage.json`, so it commits with the DB.
+- `runtime.ts` — stock `RuntimeCoordinator` with U1–U4 deps (`spaceKeySource`, queue
+  storage, `uploadVeto`, `onRemoteApplyFailed`, `getWebSocketUrl`, `reloadApp` and
+  key/password-change callbacks wired to Halting). Bootstrap (snapshot vs catch-up) is the
+  coordinator's own activation path; we never seed the cursor by hand. Note: a gap over
+  200 mutations makes activation take the snapshot path (`space-activation-service.ts:71,
+  175-182`).
+- `execute.ts` — calls the U6 shared pipeline; nothing copied from the app.
+- `writes.ts` — **one write at a time** (global async lock). Writes return 503 until the
+  initial catch-up has settled and startup outbox reconciliation is done.
+- `idempotency.ts` — `Idempotency-Key` (required on writes) → `spec.idempotencyKey =
+  'hdl_' + sha256(key)`; **never `mutationId`**, which makes the executor a receiver that
+  never queues or sends (`mutation-executor.ts:69-71`, `mutation-dispatch-service.ts:55-58`)
+  and skips `prepareMutationArgs` (`app-runtime.ts:236-239`). Before executing: if the id
+  is applied or queued, return the stored result; a hit without a stored result returns
+  `200 {status:"applied", result:null, mutationId}`. The key→result map lives in
+  `storage.json` (write-through, written right after execute, before the response),
+  bounded at 2000 entries like the applied set (`offline-queue.ts:16`). Callers retry
+  within minutes; an evicted key can re-execute, documented in the API.
 
 ### Read-only is structural
 
-`HEADLESS_READ_ONLY=true` (milestone 1, and the first days in production) builds the
-coordinator with `uploadBlob`, `uploadEncryptedKey` and the mutation send path replaced
-by stubs that throw, `canUploadSnapshot = () => false`, and the REST layer without write
-routes. No code path can write to the server.
+`readOnly: true` (milestone 1, and the first days in production): `uploadBlob` and
+`uploadEncryptedKey` are stubs that throw, `uploadVeto = () => true`, the WebSocket shim
+allows only catch-up/ping frames, and the REST layer has no write routes. No code path can
+write to the server; a test sends every other frame type and expects a throw.
 
 ### Halting
 
-Any of: `FormatTooNewError`, `UnknownOpCodeError`, HTTP 426, a quarantined or failed
-remote mutation, key or password change, server version ≠ bundled version (checked at
-startup via `appmeta`). Then: `destroy()` transport and context, freeze the outbox (no
-resend), `canUploadSnapshot` false, writes return 503, reads keep serving the last good
-state with `stale: true`. Restart only by operator action (container restart after the
-cause is fixed). Never auto-reload, never re-key.
+Triggers: `FormatTooNewError`, `UnknownOpCodeError`, HTTP 426, `onRemoteApplyFailed`, key
+or password change, server version ≠ bundled version (startup and every reconnect,
+`GET /api/v1/version/latest` → `build_version`, compared to `package.json` of the pinned
+tag). Action: `coordinator.halt(reason)` (U3): no more sync, timers, uploads, downloads or
+outbox sends; local persistence flushed; DB stays open. Writes return 503; reads keep
+serving the last good state with `stale: true`. Restart only by operator action. Never
+auto-reload, never re-key.
 
 Reads also report `stale: true` while a post-restore catch-up is in progress.
 
@@ -225,9 +261,12 @@ a listed name isn't in `KNOWN_OP_CODES` and prints registry ops not in any tier.
   `llmSettings.*`, and anything unlisted.
 
 Argument guards in the REST layer, before `prepareMutationArgs`: strip caller-supplied
-generated ids, `mutationId`, `meta`, `idempotencyKey`; force `budgetId =
-BUDGERO_BUDGET_ID`; for ops addressed by row id, load the row and reject if it belongs
-to another budget; `accounts.update` rejects a currency change.
+generated ids, `mutationId`, `meta`, `idempotencyKey`; set `budgetId` only on ops whose
+args carry one (adding it elsewhere changes the emitted payload); validate **every
+referenced id** against the budget: the target row and `accountId`, `categoryId`,
+`payeeId`, `labelId`, `transferAccountId`, and `updateColumn`'s `newValue` on id columns
+(`moveTransactionToNewCategory` has no budget check, `core/src/services/transactions/index.ts:1698-1708`);
+`accounts.update` rejects a currency change.
 
 The final names are fixed in the plan from the registry at the pinned tag (the review
 found `transactions.update` and `accounts.close` don't exist).
@@ -235,12 +274,13 @@ found `transactions.update` and `accounts.close` don't exist).
 ### Config (files under `/lzcapp/var/headless`, no file ⇒ idle)
 
 `config.json` (non-secret): `url` (`http://budgero.cloud.lazycat.app.budgero.lzcapp:3001`),
-`origin` (the app's public origin, must be in `WEBSOCKET_ALLOWED_ORIGINS`), `user`,
+`user`,
 `spaceId`, `budgetId`, `readOnly`, `allowDestructive`, `port` (8787).
 Secret files, mode 600: `password`, `space.key` (raw base64, from Settings → Push API →
 export), `tokens` (one bearer per consumer, one per line, `name:token`).
 With no `config.json` the service idles, `/v1/status` says `not_configured`, and it never
-contacts the server. `TZ=Europe/Rome` in the container. `local.env` is not used (it is a
+contacts the server. `TZ=Europe/Rome` and `BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}` come
+from the manifest (the same value the server's `WEBSOCKET_ALLOWED_ORIGINS` uses). `local.env` is not used (it is a
 build-time manifest substitution, not runtime config).
 
 ### REST API (v1)
@@ -269,31 +309,46 @@ milliunits.
   over the Lazycat internal network (cloudflared, another app, already reaches other apps'
   `*.lzcapp` names); no ingress, no tunnel. To verify in milestone 3.
 - **Store package**: service optional, idle without config.
-- **Version**: build on the latest upstream tag at start; NAS (v1.21.5) upgraded to that
+- **Version**: build on the latest **release tag** at start (not master: `e40723e` reports
+  1.22.1 in `package.json` under a v1.22.2 merge); NAS (v1.21.5) upgraded to that
   tag in milestone 3 after a blob + DB backup (one-way migrations). Headless refuses to
   run against a different server version.
 - **Push queue**: not processed by the headless (needs U5).
 
 ## Milestones
 
-1. **Read-only client.** U1, U2, U4 + platform pieces + read routes + Halting.
-   Done when, against a throwaway space on a local `budgero serve` at the pinned tag:
-   a transaction added in the web app appears in `GET /v1/transactions` within 5 s;
-   restart resumes from cursor without re-downloading; month numbers equal the web app's
-   for 3 months; **kill-at-every-await crash test** (kill during catch-up apply, during
-   restore, during commit) never yields a doubled or missing row after restart; a forced
-   409 restore and an out-of-band upload from the web app both converge; header and WS URL
-   contract tests pass.
-2. **Writes.** U3 + execute/idempotency + op policy + write routes.
-   Done when, on the throwaway space: ops via REST appear live in an open web app;
-   **parity**: the same op sequence through headless and through the app's fuzz harness
-   yields identical DB **and byte-identical emitted payloads `{op, args, v}`**; retrying a
-   request with the same `Idempotency-Key` never adds a row; killing mid-outbox delivers
-   each mutation exactly once; a key change from the web app halts the headless with no
-   further sends; a remote mutation made to fail (test hook) halts instead of quarantining.
-3. **Deploy.** NAS upgrade (backup first), `fliva/budgero-headless:<budgero version>` built
-   from the same tag as the server image, `headless` service in the manifest bound to
-   `/lzcapp/var/headless`, reachability from the Ambrogio container verified. Real space
+1. **Read-only client + test bench.** U1, U2, U3 (halt/veto), U4, U6 + platform pieces +
+   read routes + Halting, plus the bench:
+   - local server: `docker run budgero/budgero:<pinned tag>`, `/api/v1/auth/local/register`;
+   - `bench/create-space.ts`: test-only Node script that registers a user, creates a space
+     and generates/wraps/uploads its key with the runtime's `KeyVault` (the headless
+     itself never does), writes the raw key for the headless; there is no upstream e2e
+     setup to reuse;
+   - `bench/peer.ts`: a second client (stock coordinator with the same platform pieces)
+     that writes through the real server, standing in for the web app;
+   - crash harness: named fault points in our platform layer (state store: after DB temp
+     write, after fsync, after rename, around `storage.json`; outbox save; WS message
+     received before apply; applied before persist). Headless runs as a child process,
+     `SIGKILL` at point k for every k, then a randomized kill loop. Oracle: a fresh
+     headless bootstrapped from an empty dir, compared on user tables and the server log.
+   Done when: a peer write appears in `GET /v1/transactions` within 5 s; restart resumes
+   from cursor without a snapshot download (gap ≤ 200); month numbers equal the peer's
+   core figures for 3 months; every crash point and 200 random kills leave no doubled or
+   missing row; forced 409 restore and out-of-band upload converge; header, WS URL and
+   outbound-frame contract tests pass.
+2. **Writes.** Execute/idempotency + op policy + write routes.
+   Done when, on the bench: REST ops appear at the peer; **in-process parity test**: harness
+   `Device`s and a headless executor loaded from the same template bytes, same seeded
+   `randomUUID`, `setClock`, FX stub; same op sequence ⇒ equal `{op, args}`, `v` computed
+   with `mutationFormatVersion` on both sides, equal user tables (excluding `user_id` and
+   timestamps in `mutation_history`); same `Idempotency-Key` twice ⇒ one row, also with
+   concurrent requests; crash points around execute/queue/send/ack deliver each mutation
+   exactly once and locally present; a key change at the peer halts the headless with no
+   further sends; a remote mutation forced to fail halts before any cursor move.
+3. **Deploy.** NAS upgrade to the pinned tag (blob + DB backup first). Headless image built
+   from the fork's pnpm workspace (stage 1 of `selfhost.Dockerfile`), mirrored to the
+   Lazycat registry like the server image; `headless` service in the manifest bound to
+   `/lzcapp/var/headless`; reachability from the Ambrogio container verified. Real space
    read-only for a few days, then writes.
 4. **Ambrogio adapter** — separate project in the Ambrogio repo. Not designed here.
 
@@ -308,10 +363,10 @@ milliunits.
 
 ## Testing
 
-- Unit: config/idle, state-store atomicity, auth refresh, op-policy coverage, argument
-  guards, header and WS URL contracts.
-- Integration: local `budgero serve` at the pinned tag + headless + app harness as second
-  client, throwaway space from a setup script; crash and parity tests above.
+- Unit: config/idle, state-store generations, auth refresh, op-policy coverage, argument
+  guards, header / WS URL / outbound-frame contracts, idempotency map bounds.
+- Bench (milestone 1): local server at the pinned tag, `create-space`, `peer`, crash
+  harness; parity test in-process (milestone 2).
 - Never against the real space.
 
 ## Risks
