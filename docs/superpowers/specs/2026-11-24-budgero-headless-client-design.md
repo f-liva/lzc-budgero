@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: **v20**, after nineteen adversarial review rounds (38 reviewers; every critical/important finding verified in code at the pin).
+Date: 24/11/2026. Status: **v21**, after twenty adversarial review rounds (40 reviewers; every critical/important finding verified in code at the pin).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet).
 Pin: upstream tag **v1.22.1 = `e40723e`**. `file:line` references are at that pin, relative to
 `packages/` of the Budgero monorepo unless another repo is named.
@@ -190,7 +190,7 @@ promise chain per file, content snapshotted at call time.
   "none" if the id left the queue without one (implicit ack). The verdict applies to **every
   op whose ledger record has a `base`**, whether or not its HTTP request has already
   answered (a 202'd op acked after a reconnect is checked too); ops being drained at startup
-  (record marked `drained`) are plain acks (`result: null` + `entry`).
+  (op marked `drained`) are plain acks (`result: null` + `entry`).
 - `ledger.ts`: `ledger.json` (8.3).
 - `http.ts`: `blobApi` **download side only** (`downloadBlob`, null only on 404;
   `getDatabaseState`), `spacesApi`, `getProfile`, `checkApiHealth` (`HEAD /health`), login,
@@ -232,7 +232,7 @@ promise chain per file, content snapshotted at call time.
 | reads | 503 | 503 until the activation report is accepted, then 200 + `stale: true` | 503 | 200 | 503 | 503 | 503 |
 | writes needing execution | 503 | 503 | 503 | gate (8.1) | 503 | 503 | 503 |
 | writes answered from the ledger record | — | yes | yes | yes | yes¹ | yes | yes |
-| `POST /v1/admin/quarantine/{id}/ack` | 404 | 200 | 200 | 200 | 200 | 200 | 503 |
+| `POST /v1/admin/quarantine/{key}/ack` | 404 | 200 | 200 | 200 | 200 | 200 | 503 |
 | `POST /v1/admin/outbox/{id}/drop` | 404 | 409 | 409 | 409 | 200 | 409 | 503 |
 
 ¹ `acked`/`dropped`/`failed`/`skipped` records answer normally; `queued`/`nacked`/`intent` ⇒
@@ -322,8 +322,8 @@ the file chains, exit **143**.
    (exit 75) after the apply-phase lock and the in-flight HTTP response (8.1 step 5).
 6. Throws, by phase and index. In the same ledger write op i becomes `failed` and ops
    i+1..k become `skipped` (a retry never executes them). **i = 1** ⇒ **422** (nothing
-   landed). **i > 1** ⇒ **200 `partial: true`** with per-op states (ops 1..i-1 are already
-   sent). A throw in `prepareMutationArgs` needs no rebuild (nothing applied). A throw in
+   landed). **i > 1** ⇒ **200 `partial: true`** once ops 1..i-1 have dequeued, else 202 `pending`
+   with per-op states (ops 1..i-1 are already sent). A throw in `prepareMutationArgs` needs no rebuild (nothing applied). A throw in
    apply leaves partial writes in memory (op i never reached `outbox.add`): state
    `draining` **synchronously** (reads 503, no new write passes the gate, the global write
    lock is kept until exit), sync stays alive until ops 1..i-1 have dequeued or 30 s passed,
@@ -336,15 +336,13 @@ no verdict (writes are 503 during a drain, so no live request exists); an op of 
 record re-executed later goes through the gate and is checked normally.
 **Remote apply failures** are never decided by the headless (error classes are not
 reliable: plain `Error` throws, `ValidationError` from a failed FX fetch,
-`transactions.ts:1218-1234`, `core/.../transactions/index.ts:1208-1216`). On any path
-`onRemoteApplyFailed` returns `'restore'`: the mutation is retried after an in-process
-restore and, if it fails again, **quarantined by upstream exactly as on every other
-device** (`sync-transport.ts:1226-1244, 1397-1419`). The headless then (8.4): persists it in
-`quarantine.json`, seeds those ids into the applied-id shim at every start (otherwise a
-stateless client would hit the poison on every rebuild), reports them, and **blocks writes**
-until the operator acknowledges each one — because a failure that happens only on the
-headless (Lingui stub, missing service, Node-only behaviour) would be quarantined here
-alone and diverge silently, and only a human can tell the two apart. Reads stay up.
+`core/.../transactions/index.ts:1208-1216`). On any path the mutation is retried after an
+in-process restore and, if it fails again, **quarantined by upstream exactly as on every
+other device** (`sync-transport.ts:1226-1244, 1397-1419`). The headless persists it (8.4) and
+serves its key to upstream through `skipMutationIds()` (U3), so it is skipped at every start
+and after every restore; it never touches the applied-id set. Writes are blocked until the
+operator rules on each entry (ack, or retry after a code fix): a failure that happens only on
+the headless would otherwise be quarantined here alone and diverge silently.
 ### 7.6 Locks, rebuild, supervisor, exit codes
 
 **Apply-phase lock**: taken by a write before the gate, released in a `finally` when the
@@ -355,7 +353,7 @@ path (75, 76, 77, 78, 143) and `beforeRestore` wait for it.
 **Rebuild**: wait for the apply-phase lock → (76 only: wait for dequeues of landed ops, 30
 s) → **answer any request still in step 5 at once** (200 `reordered` if a verdict landed; on a 76, 200
 `partial` only when ops 1..i-1 have dequeued, else 202 `pending` with per-op states incl.
-`failed`/`skipped`; never 200 for an op the server has not acked) → `halt()` → wait for both file chains → write
+`failed`/`skipped`; never 200 for an op the server has not acked) → `halt()` → wait for **all** file chains (outbox, ledger, quarantine, halts) → write
 `exit-info {reason, outbox_size, uptime_s}` → `process.exit(<code>)`. The global write lock is held
 from the triggering request until exit. In-process re-activation is not used (re-activating
 the same space keeps the old transport alive, `runtime-lifecycle-service.ts:176-179`).
@@ -387,7 +385,7 @@ Reasons: `version_mismatch`, `auth_failed`, `protocol_426`, `space_reset`, `ws_f
 (`onFormatTooNew`), `unknown_op` (`onUnknownOpCode`), `key_changed` (`onEncryptionKeyChanged`), `password_changed`
 (`setPasswordChangedReason`/`reloadApp`), `bootstrap_failed:<download|decrypt|migrations>`,
 `outbox_write_failed`, `queue_cleared`, `access_denied`, `restore_loop`, `restore_failed`.
-`remote_apply_failed` is no longer a halt reason (8.4). Storms (`rebuild_storm`,
+Storms (`rebuild_storm`,
 `restore_storm`) are detected and served by the supervisor alone, never by the worker. Action:
 `coordinator.halt(reason)`, routes per 7.3, `halts.log` appended. Never auto-reload, never
 re-key, never leave `halted` except by operator restart; the halted check precedes
@@ -435,8 +433,9 @@ that save resolves. `queued` precedes the outbox rename, so a crash between them
 timeout; upstream resends. `invalid`, `format_too_new`, `other` ⇒ ledger `nacked`, state
 `outbox_blocked`, `outbox_divergent: true`. **No nack is ever answered with 409 while the
 entry is on disk** (upstream resends forever and the op can still land). Empty-id nack ⇒
-`last_nack` only. A live `invalid` nack: `halt()` (stops the resend sweep), state
-`outbox_blocked` in-process, routes per 7.3. Operator: `POST /v1/admin/outbox/{id}/drop`
+`last_nack` only. Any **blocking** nack (`invalid`, `format_too_new`, `other`) while
+running: `halt()` (stops the resend sweep, so nothing is on the wire), state
+`outbox_blocked` in-process with `reason: nack_blocked`, routes per 7.3. Operator: `POST /v1/admin/outbox/{id}/drop`
 (role `admin`) is accepted **only in `outbox_blocked` and only on a record with a `nacked`
 op** (409 otherwise: anywhere else a `queued` op may already be on the wire; in
 `outbox_blocked` the send window of 1 guarantees nothing behind the nacked op was sent); it
@@ -476,16 +475,24 @@ record's `reordered`.
 ### 8.4 Quarantine
 
 `onQuarantined(mutation, error)` ⇒ upsert `{key, id, version, op, error: {name, message}, at,
-acked}` in `quarantine.json` (idempotent per key: an existing entry keeps its `acked`),
-`halts.log` `quarantine`, `/v1/status.quarantined: [{key, version, op, error, acked}]`;
-writes answer 503 `quarantine_pending` while any entry is unacked (reads stay 200; a
-retry answered from the ledger record still answers). The operator judges from `op` and
-`error` whether the failure is Budgero's own (the same mutation is quarantined on the
-phone too) or headless-only (Lingui stub, missing service, Node-only behaviour: then the
-headless DB diverges and the fix is code, not an ack) and calls
-`POST /v1/admin/quarantine/{id}/ack` (role `admin`). `skipMutationIds()` serves every key
-to upstream at every start and after every restore, so the mutation is skipped exactly as
-every other device skips it after its own quarantine, and never quarantined twice.
+acked: false, covered: false}` in `quarantine.json` (idempotent per key: an existing entry
+keeps its flags), `halts.log` `quarantine`, `/v1/status.quarantined`. **Writes answer 503
+`quarantine_pending` while any entry is neither acked nor covered** (reads stay 200; a retry
+answered from the ledger record still answers). Keys follow `catchUpFailureKey`
+(`sync-transport.ts:1393-1395`): `id`, or `version:N` for an id-less mutation; the hook
+receives both id and version (U3 passes `m.version`), so either form is matched.
+
+A quarantine is **not forever**:
+- **covered**: at every start, an entry whose `version ≤` the restored snapshot's bound
+  version is marked `covered` and leaves `skipMutationIds()` and the gate: whatever the
+  snapshot holds came from a peer, so the headless matches that peer;
+- **ack** (`POST /v1/admin/quarantine/{key}/ack`, role `admin`): the operator, reading `op`
+  and `error`, accepts that the same mutation is quarantined on the phone too (Budgero's own
+  semantics);
+- **retry** (`POST /v1/admin/quarantine/{key}/retry`): after a code fix or a transient cause
+  (e.g. an FX fetch that failed during apply, `core/.../transactions/index.ts:1208-1216`):
+  removes the entry and exits 77; the next start replays the mutation, and a second failure
+  quarantines it again.
 
 ## 9. Op policy (Federico, 24/11: allowlist + key for destructive)
 
@@ -551,7 +558,8 @@ Bearer from `tokens`, constant-time compare, never echoed. Amounts in integer mi
 - `GET /healthz` — `{state, reason}`, no auth, codes per 7.3.
 - `GET /v1/status` — `{state, reason, stale, cursor, outbox_size, outbox_divergent,
   last_nack: {id, code, at}|null, rebuilds_24h, restores_24h, live_since, last_exit: {code,
-  reason, at}|null, rules_in_budget, restores_inproc_24h, quarantined: [{id, version, acked}],
+  reason, at}|null, rules_in_budget, restores_inproc_24h, quarantined: [{key, version, op,
+  error, acked, covered}],
   versions: {server, bundled}}`.
 - Reads (scoped to `budgetId`, via core services): `/v1/accounts`, `/v1/category-groups`,
   `/v1/categories`, `/v1/payees`, `/v1/transactions?account=&category=&payee=&since=&until=
@@ -570,7 +578,7 @@ Bearer from `tokens`, constant-time compare, never echoed. Amounts in integer mi
   entries of absolute totals read from the month rows (one when either side is `rta`; from
   `rta` = plain assignment); `budgetId` forced per entry; over-assign check only from `rta`.
   The generic `monthlyBudgets.upsertAssignment` op applies the `PUT`'s checks.
-- `POST /v1/admin/outbox/{id}/drop` — 8.2; `POST /v1/admin/quarantine/{id}/ack` — 8.4.
+- `POST /v1/admin/outbox/{id}/drop` — 8.2; `POST /v1/admin/quarantine/{key}/ack` — 8.4.
 
 Example (Ambrogio adds an expense):
 ```http
@@ -633,11 +641,13 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
    mutation whose apply throws (`updateColumn` on a deleted row, injected while the headless
    is down and the peer stopped, throwaway space) ⇒ in-process restore, retry, quarantine,
    `quarantined: [1 entry]` with `op`/`error`, no exit 77 in `rebuilds.log`; restart **and**
-   a forced in-process restore ⇒ no new entry, mutation skipped; 51 forced in-process
+   a forced in-process restore ⇒ no new entry, mutation skipped; a peer snapshot bound past
+   it ⇒ `covered` on the next start; `retry` ⇒ exit 77, replay, re-quarantine; 51 forced in-process
    restores ⇒ halt `restore_loop`; unknown op code ⇒ halt `unknown_op`; header,
    WS URL and frame tests; proxy saw **only** allowlisted calls (login, `GET /profile`, `GET
    /budget-spaces`, `HEAD /health`, `GET /database/blob`, `GET /database/state`, `GET
-   /version/latest`, WS upgrade), each at least once; exits 75/76/77 relaunch, 1 stays down,
+   /version/latest`, WS upgrade; `GET /exchange-rates` allowed but not required, a peer
+   write in another currency triggers it during apply), each required one at least once; exits 75/76/77 relaunch, 1 stays down,
    21st 75 / 51st 77 in 24 h (bench stub worker) ⇒ storm with `/healthz` 503.
 2. **Writes.** §8–10, drain rule, latch. **Done when:** REST ops appear at the peer and in its
    next snapshot; **parity test in the app's vitest** (harness `Device`s and a headless
