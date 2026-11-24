@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: **v17**, after sixteen adversarial review rounds (32 reviewers; every critical/important finding verified in code at the pin).
+Date: 24/11/2026. Status: **v18**, after seventeen adversarial review rounds (34 reviewers; every critical/important finding verified in code at the pin).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet).
 Pin: upstream tag **v1.22.1 = `e40723e`**. `file:line` references are at that pin, relative to
 `packages/` of the Budgero monorepo unless another repo is named.
@@ -182,21 +182,25 @@ promise chain per file, content snapshotted at call time.
   drop). `ackMutation` is the only upstream dequeue path here; the wrapper halts
   (`queue_cleared`) if `clear()` is called. **The ordering verdict (7.5.5) is taken on the
   dequeue observation**, using the version recorded by `onMutationAck` for that id, or
-  "none" if the id left the queue without one (implicit ack). The verdict applies **only to
-  ops of the request currently running live** (issued after a gate `base`); dequeues during a
-  startup drain are plain acks (`result: null` + `entry`).
+  "none" if the id left the queue without one (implicit ack). The verdict applies to **every
+  op whose ledger record has a `base`**, whether or not its HTTP request has already
+  answered (a 202'd op acked after a reconnect is checked too); ops being drained at startup
+  (record marked `drained`) are plain acks (`result: null` + `entry`).
 - `ledger.ts`: `ledger.json` (8.3).
 - `http.ts`: `blobApi` **download side only** (`downloadBlob`, null only on 404;
   `getDatabaseState`), `spacesApi`, `getProfile`, `checkApiHealth` (`HEAD /health`), login,
   version. No upload function; the coordinator's required `uploadBlob` is a throwing stub
   (never reached: `allowUpload` is false). Classifies every failure as **transport**
-  (connection refused, timeout, 5xx) vs **server** (4xx with a body) before the runtime
-  swallows it. Base URL also for core's relative FX path. Contract test vs `api-client.ts`.
+  (connection refused, timeout, 5xx, integrity check after a 200) vs **server** (a 4xx other
+  than 401/404, with a body) before the runtime swallows it; "no tag recorded" counts as
+  transport. Base URL also for core's relative FX path. Contract test vs `api-client.ts`.
 - `websocket.ts`: `globalThis.WebSocket` shim (`ws`) with `Origin: $BUDGERO_ORIGIN`;
   `getWebSocketUrl` (`token`, `space_id`, `protocol=SYNC_PROTOCOL_VERSION`, `client_session`).
   Detects an HTTP 426 on the upgrade ⇒ halt `protocol_426`; a 404 upgrade or a close with
-  reason `space_reset` ⇒ halt `space_reset`; a 403 upgrade or a close with reason
-  `member_removed`/`blocked` (`hub.go:21-25`) ⇒ halt `access_denied`. **On every (re)connect** it runs the **blob
+  reason `space_reset` ⇒ halt `space_reset`; a close with reason `member_removed`/`blocked`
+  (`hub.go:21-25`) ⇒ halt `access_denied`; a 403 upgrade ⇒ halt `ws_forbidden` (Origin mismatch
+  or access revoked); a 401 upgrade (`websocket.go:158-161`) ⇒ token refresh, then
+  `auth_failed` if it repeats. **On every (re)connect** it runs the **blob
   check**: `getDatabaseState().version` vs `getSyncDiagnostics().blobVersion`; server newer ⇒
   `draining` + exit 77 (upstream would skip the download after a local write); check failed
   ⇒ gate closed, retry. An `out_of_band` `sync_state_changed` frame with a newer version
@@ -225,7 +229,8 @@ promise chain per file, content snapshotted at call time.
 | writes answered from the ledger record | — | yes | yes | yes | yes¹ | yes | yes |
 | `POST /v1/admin/*` | 404 | 503 | 503 | 200 | 200 | 200 | 503 |
 
-¹ `acked`/`dropped`/`failed` records answer normally; `queued`/`nacked` ⇒ 202 `blocked`.
+¹ `acked`/`dropped`/`failed`/`skipped` records answer normally; `queued`/`nacked`/`intent`/
+`unknown` ⇒ 202 `blocked`.
 
 After an exit the supervisor serves `/healthz` (503) and `/v1/status` (`{state:"halted",
 reason}`, no bearer) only, except on 143 where it exits too.
@@ -242,7 +247,7 @@ reason}`, no bearer) only, except on 143 where it exits too.
 3. Read `rebuilds.log` (429 window, `last_exit`; budgets are the supervisor's).
 4. Ledger reconciliation: `queued` ops missing from `outbox.json` are appended (same entry);
    `dropped` ids present are removed; `acked` ids present are removed; `unknown` ops become
-   `queued` if present, `failed` otherwise.
+   `queued` if present, `failed` otherwise (and later ops of that record `skipped`).
 5. Nacked check: a ledger `nacked` op still in `outbox.json` ⇒ `outbox_blocked`, **no
    activation**; admin routes served (read-only mode included).
 6. Read-only check: `readOnly` and non-empty outbox ⇒ `reason=outbox_in_readonly`, exit 1
@@ -252,10 +257,12 @@ reason}`, no bearer) only, except on 143 where it exits too.
 8. Login: transport error ⇒ retry; 401 ⇒ halt `auth_failed`. Token refreshed on any later
    401 and before expiry (`SELF_HOST_JWT_TTL_HOURS`, 720 on the NAS); a 401 on re-login ⇒
    halt `auth_failed`.
-9. Activate (7.5). A **transport** download failure ⇒ exit **78** (`retry_bootstrap`; the
-   coordinator has already connected, `space-activation-service.ts:385-391`, and in-process
-   re-activation is not used) — the supervisor relaunches with backoff, uncounted; a
-   **server** failure ⇒ halt `bootstrap_failed:download`.
+9. Activate (7.5). A **transport** download failure ⇒ `halt()` first (catch-up from cursor 0
+   is already running on the empty fallback DB, `space-activation-service.ts:385-391`), then
+   exit **78** (`retry_bootstrap`) — the supervisor relaunches with exponential backoff (5 s →
+   5 min, reset after a `live` of 10 min) and serves `/healthz` 503 meanwhile; after **20
+   consecutive 78** it stays down with `bootstrap_failed:download`. A **server** failure ⇒
+   halt `bootstrap_failed:download` at once.
 
 Shutdown on `TERM`/`INT`: `shutting_down`, wait for the apply-phase lock, `halt()`, wait for
 the file chains, exit **143**.
@@ -277,9 +284,17 @@ the file chains, exit **143**.
    outbox, because the catch-up-unsafe restore runs inside the transport's serialised receive
    chain (`runtime-context-factory.ts:251-259`, `sync-transport.ts:478-487, 1492-1510`) and
    the acks sit behind it — then lets the restore proceed into a DB that will be thrown
-   away; exit **77** follows as soon as the lock is free, leftovers drain at the next start.
-   A restore that started always ends in a rebuild. Triggers: the headless blob check on
-   reconnect, an out-of-band frame, a catch-up-unsafe fallback.
+   away. What follows depends on the trigger, which U3 passes to `beforeRestore({reason})`:
+   - blob check on reconnect, out-of-band frame ⇒ exit **77** as soon as the lock is free;
+     leftovers drain at the next start;
+   - **catch-up-unsafe fallback** (`apply_failed`, gap, bad page) ⇒ **no exit**: the restore
+     completes in-process so upstream's second attempt can run. Upstream quarantines a
+     mutation only on its **second** failure at the same `precedingVersion`, remembered in an
+     in-memory map (`sync-transport.ts:194, 1231-1244`): exiting on the first failure would
+     restart with an empty map and loop into `restore_storm`. State stays `draining` (reads
+     503, writes 503) until catch-up has settled again; then, because the restored DB may
+     have been built while a request was in flight, exit **77** if any op of a live request
+     was unacked at restore time, else back to `live`.
 5. **Live ordering check, per request.** Gate (8.1) read under the apply-phase lock:
    `base = max(cursor, highest version among own acks)` (the ack handler calls
    `onMutationAck` before `updateLocalVersion`, so the cursor can lag one own ack). The
@@ -306,32 +321,40 @@ the file chains, exit **143**.
    the response goes out, then rebuild (exit **76**). In `outbox.add` of op i ⇒ ledger
    `unknown`, **202 `unknown`**, halt `outbox_write_failed`.
 
-**Drain rule** (startup drain, 7.5.3): a drain ends when the outbox is empty **or the latch
-is closed**; once the latch is closed the process exits 75 as soon as the apply-phase lock is
-free, and the leftovers drain at the next start. A peer op whose apply fails on the headless
-is **quarantined by upstream exactly as on every other device** (`sync-transport.ts:1226-1240,
-1397-1419`; e.g. our leftover `updateColumn` on a row a peer deleted throws `NotFoundError`,
-`core/.../transactions/index.ts:958-963`); the DBs still match, so this is **not** a halt: it
-is logged (`quarantined` counter in `/v1/status`, `halts.log` entry with `quarantine`).
-`onRemoteApplyFailed` therefore halts only on the **first** failure of a mutation that is not
-yet quarantined on the server-ordered replay — i.e. during live apply — and lets the catch-up
-retry/quarantine path run.
+**Drain rule** (startup drain, 7.5.3): a drain ends when the outbox is empty; records being
+drained are marked `drained` so their dequeues take no verdict. If a reorder verdict closes
+the latch during a drain (an op of a live request, not a drained one), the process exits 75
+as soon as the apply-phase lock is free.
+
+**Remote apply failures are decided by error class, on both paths** (`onRemoteApplyFailed(
+mutation, error, path)`, `path ∈ live|catchup`): an error in the **deterministic domain
+allowlist** (`NotFoundError`, core validation errors; e.g. a peer's edit of a row we deleted,
+or our leftover `updateColumn` on a row a peer deleted, `core/.../transactions/index.ts:958-963`)
+is what every other device sees too ⇒ not a halt: the live path logs and does nothing
+(upstream pulls the mutation again through gap catch-up, `:1097-1107`), the catch-up path
+lets upstream retry and **quarantine** (`:1226-1244, 1397-1419`); the DBs still match. The
+quarantine is reported through U3 `onQuarantined(id)` (upstream only logs
+`catch_up_mutation_quarantined`, `:1407-1418`) → `/v1/status.quarantined`, `halts.log`
+`quarantine`. **Any other error** (missing service in `global.ts`, Lingui stub, U6 gap,
+Node-only behaviour) would be quarantined on the headless alone and diverge silently ⇒ halt
+`remote_apply_failed` before `handleCatchUpUnsafe` runs.
 
 ### 7.6 Locks, rebuild, supervisor, exit codes
 
 **Apply-phase lock**: taken by a write before the gate, released in a `finally` when the
 `executeMutation` chain has returned (or thrown) for every op of the request, which happens
 after the send loop or after the offline-queue path; it never waits for an ack. Every exit
-path (75, 76, 77, 143) and `beforeRestore` wait for it.
+path (75, 76, 77, 78, 143) and `beforeRestore` wait for it.
 
 **Rebuild**: wait for the apply-phase lock → (76 only: wait for dequeues of landed ops, 30
-s) → finish the in-flight HTTP response → `halt()` → wait for both file chains → write
+s) → **answer any request still in step 5 at once** (200 `reordered` if a verdict landed,
+else 202 `pending` with per-op states) → `halt()` → wait for both file chains → write
 `exit-info {reason, outbox_size}` → `process.exit(<code>)`. The global write lock is held
 from the triggering request until exit. In-process re-activation is not used (re-activating
 the same space keeps the old transport alive, `runtime-lifecycle-service.ts:176-179`).
 
 **Supervisor** (`entrypoint.sh`, child of Lazycat's `lzcinit` because `setup_script` is
-used): relaunches on 75/76/77/78 (78 with exponential backoff, 5 s → 5 min), stays down otherwise, traps `TERM`/`INT` and forwards them
+used): relaunches on 75/76/77/78 (78 with the backoff and cap of 7.4 step 9), stays down otherwise, traps `TERM`/`INT` and forwards them
 (`trap 'kill -TERM "$child"; wait "$child"; exit 143' TERM INT`), is the **only writer** of
 `rebuilds.log` (`{ts, code, reason, outbox_size}` for every child exit, reading `exit-info`),
 enforces budgets, and after a storm or a non-rebuild exit serves `/healthz` 503 and
@@ -351,7 +374,7 @@ enforces budgets, and after a storm or a non-rebuild exit serves `/healthz` 503 
 
 ### 7.7 Halting
 
-Reasons: `version_mismatch`, `auth_failed`, `protocol_426`, `space_reset`, `format_too_new`
+Reasons: `version_mismatch`, `auth_failed`, `protocol_426`, `space_reset`, `ws_forbidden`, `format_too_new`
 (`onFormatTooNew`), `unknown_op` (`onUnknownOpCode`), `remote_apply_failed`
 (`onRemoteApplyFailed`), `key_changed` (`onEncryptionKeyChanged`), `password_changed`
 (`setPasswordChangedReason`/`reloadApp`), `bootstrap_failed:<download|decrypt|migrations>`,
@@ -500,7 +523,7 @@ Bearer from `tokens`, constant-time compare, never echoed. Amounts in integer mi
 - `GET /healthz` — `{state, reason}`, no auth, codes per 7.3.
 - `GET /v1/status` — `{state, reason, stale, cursor, outbox_size, outbox_divergent,
   last_nack: {id, code, at}|null, rebuilds_24h, restores_24h, live_since, last_exit: {code,
-  reason, at}|null, rules_in_budget, versions: {server, bundled}}`.
+  reason, at}|null, rules_in_budget, quarantined, versions: {server, bundled}}`.
 - Reads (scoped to `budgetId`, via core services): `/v1/accounts`, `/v1/category-groups`,
   `/v1/categories`, `/v1/payees`, `/v1/transactions?account=&category=&payee=&since=&until=
   &cleared=&limit=&offset=`, `/v1/transactions/{id}`, `/v1/months/{YYYY-MM}`
@@ -574,13 +597,16 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
    `dumpDb(adapter, {sequences: true, crossDevice: true})` (`fuzz/harness.ts:104-225`, run in
    the app's vitest which spawns the headless) equal to the peer's, `mutation_history` as a
    set of `MutationID`s; peer out-of-band upload ⇒ exit 77 then `live`, also when it happens
-   while the socket is down after a headless write; forced server-side download failure ⇒
-   halt `bootstrap_failed:download`; server unreachable before activation ⇒ `bootstrapping` retries; server dropping during
-   the blob download ⇒ exit 78 and relaunch; a WS drop with no newer blob ⇒ **no** restore
+   while the socket is down after a headless write; proxy answering the blob with **422 and a body** ⇒
+   halt `bootstrap_failed:download`; server unreachable before activation ⇒ `bootstrapping`
+   retries; proxy returning 500 on the blob ⇒ exit 78 with backoff, 20 consecutive ⇒ stays
+   down; a WS drop with no newer blob ⇒ **no** restore
    (`recentDownloadWindowMs` policy); remote
-   mutation whose apply throws (`updateColumn` with `columnName: 'cleared'`, injected while
-   the headless is down and the peer stopped, throwaway space) ⇒ halt
-   `remote_apply_failed` before any cursor move; unknown op code ⇒ halt `unknown_op`; header,
+   mutation whose apply throws a **non-domain** error (bench-only op registered to throw
+   `TypeError`, injected while the headless is down and the peer stopped, throwaway space)
+   ⇒ halt `remote_apply_failed` before any cursor move; remote mutation throwing a **domain**
+   error (`updateColumn` on a deleted row) ⇒ in-process restore, retry, `quarantined: 1`,
+   no exit 77 in `rebuilds.log`; unknown op code ⇒ halt `unknown_op`; header,
    WS URL and frame tests; proxy saw **only** allowlisted calls (login, `GET /profile`, `GET
    /budget-spaces`, `HEAD /health`, `GET /database/blob`, `GET /database/state`, `GET
    /version/latest`, WS upgrade), each at least once; exits 75/76/77 relaunch, 1 stays down,
@@ -596,10 +622,10 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
    ledger entries; same key twice concurrently ⇒ one mutation; proxy holds the headless
    frame until a peer mutation is acked ⇒ 200 `reordered`, exit 75, `dumpDb` equal after,
    retry returns `reordered` and `id: null`; proxy **drops the ack frame** and the op returns
-   via catch-up ⇒ `reordered` from the dequeue observer; restore during a 2-op `PATCH` with
-   op 1 held behind a peer mutation ⇒ exit 77 within 10 s with op 2 left queued, next start
-   drains it; a leftover `updateColumn` on a row the peer deleted ⇒ quarantined, no halt,
-   `quarantined: 1` in status; injected
+   via catch-up ⇒ `reordered` from the dequeue observer; out-of-band restore during a 2-op `PATCH` (no
+   peer interleave) ⇒ the request answers 202 at once, exit 77 within 10 s, next start drains
+   op 2; a 202'd op acked after a reconnect at a version ≠ `base+1` ⇒ `reordered` persisted
+   and exit 75; injected
    `storage_error` ⇒ 202 then one log entry; injected `invalid` ⇒ `outbox_blocked` across a
    restart, admin drop, then 409; write while the socket is down ⇒ 503; budget with one
    continuous rule ⇒ `transactions.add` lands with no `rules.execute` and `rules_in_budget:
