@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: draft v9, after review rounds 1–8 (sixteen adversarial reviewers;
+Date: 24/11/2026. Status: draft v10, after review rounds 1–9 (eighteen adversarial reviewers;
 every critical/important finding verified in code and folded in below).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet; we start anyway).
 Code references and the pin: upstream tag **v1.22.1 = `e40723e`** (also master HEAD on 24/11).
@@ -174,7 +174,15 @@ post-restore migrations and catch-up correctly); we keep it and add injection po
 - **U2 — injected queue storage.** `runtime-context-factory.ts:201` passes a
   `QueueStorage` from deps to `new OfflineQueue(spaceId, storage)` (constructor already
   accepts it, `offline-queue.ts:56`); export `deserializeMutation`
-  (`offline-queue/storage.ts:40`).
+  (`offline-queue/storage.ts:40`). Plus a real upstream bug fix: `OfflineQueue.add` pushes
+  into memory **before** `await storage.save` (`offline-queue.ts:67-69`), and both the
+  resend sweep (`getStale`, `offline-queue.ts:141-147`, run every 20 s by
+  `reconnection-service.ts:336-352`) and `replayQueueViaSync` (`:244-280`) can send an
+  entry that is not yet durable, contradicting the "queued durably BEFORE any send"
+  comment at `mutation-dispatch-service.ts:71-74`. U2 adds a `persisting` set to
+  `OfflineQueue`: ids are added before the save and removed when it resolves;
+  `getStale()` and the replay skip them. Without it, "`intent` ⇒ the server has nothing"
+  (ledger rules) would be false.
 - **U3 — hooks.**
   - `allowUpload?: () => boolean`, ANDed with the existing `DatabaseSyncDeps.canUploadSnapshot`
     (`runtime-context-factory.ts:173-174`), checked inside `doUpload` immediately before
@@ -261,9 +269,16 @@ included at their server position.**
    serialised, so there is exactly one). Before the request, cursor `c` is read from
    `coordinator.getSyncDiagnostics()` (cursor, `catchUpInProgress`, `pendingCount`,
    `runtime-coordinator.ts:720-733`); the request is accepted only when
-   `catchUpInProgress` is false and `pendingCount === 0`. The server assigns each op its
-   position (`onMutationAck(id, v)`). The request's ops must be acked with versions
-   exactly `c+1 … c+k` in send order. Any gap, or **a dequeue with no version** (implicit
+   `catchUpInProgress` is false and `pendingCount === 0`. **Base** = `max(cursor, highest
+   version among own acks so far)`: the ack handler calls `onMutationAck` **before**
+   `updateLocalVersion` (`sync-transport.ts:906-937`), and `ackMutation` empties the
+   in-memory queue before its save (`offline-queue.ts:157-162`), so right after a
+   request completes `pendingCount` is 0 while the cursor still lags by k; without the
+   max, every back-to-back write would be a false `reordered`. The server assigns each
+   op its position (`onMutationAck(id, v)`). The request's ops must be acked with
+   versions exactly `base+1 … base+k` in send order. The verdict and the `draining`
+   status flip happen **synchronously in `onMutationAck`** (U3), before any await, so a
+   request that passed the gate after a 202 can't compute on a reordered DB. Any gap, or **a dequeue with no version** (implicit
    ack through catch-up after the ack frame was lost, `hub.go:537-548` is best-effort,
    `runtime-lifecycle-service.ts:196-201`) ⇒ `reordered`: a peer mutation was ordered
    between ours; locally ours ran first, so autoincrement row ids and absolute totals
@@ -275,27 +290,42 @@ included at their server position.**
    across devices** until the next read after rebuild; then `draining` → rebuild. Writes
    are 503 `pending` while `pendingCount > 0` (follow-ups included), never on a ledger
    flag.
-6. A throw in `prepareMutationArgs` (before any apply, `app-runtime.ts:236-239`) ⇒ **422**,
-   ledger op `failed`, no rebuild. A throw after apply started (op validation such as
-   "accounts must differ" or a split sum, `transactions.ts:838-861, 618-666`;
-   `onFollowUpError`) ⇒ **422**, ledger `failed`, rebuild (partial writes are in memory,
-   `op-code-registry.ts:314-319`; nothing reached the server because `outbox.add` runs
-   after apply, `mutation-dispatch-service.ts:48-79`). A throw from `outbox.add` itself
-   (the entry is already in the in-memory queue, `offline-queue.ts:67-69`, and the sweep
-   would send it, `reconnection-service.ts:342-352`) ⇒ **halt synchronously** before any
-   await, response **202 `unknown`**, ledger `queued` if the ledger write succeeded;
-   the next start drains it. Caller-induced rebuilds (422) are rate-limited with **429**
-   (more than 5 in 10 minutes) and never count toward the storm limit.
+6. Throws, by where they happen:
+   - in the **primary's** `prepareMutationArgs` (before any apply, `app-runtime.ts:236-239`)
+     ⇒ **422**, ledger `failed`, no rebuild;
+   - in the **primary's** apply (op validation such as "accounts must differ" or a split
+     sum, `transactions.ts:838-861, 618-666`) ⇒ **422**, ledger `failed`, rebuild (partial
+     writes are in memory, `op-code-registry.ts:314-319`; nothing reached the server
+     because `outbox.add` runs after apply, `mutation-dispatch-service.ts:48-79`);
+   - in a **continuous-rules follow-up** (`onFollowUpError`, prepare or apply): the
+     primary is already queued and sent (`app-runtime.ts:244-253`), so the request is
+     **not** failed: wait for the primary's dequeue, answer **200** (or 202) with
+     `rules_failed: true`, ledger primary `acked`, follow-up `failed`; then rebuild.
+     A 422 here would make a caller re-create the transaction under a new key: doubled
+     on every device;
+   - from `outbox.add` itself (the entry is already in the in-memory queue but, with the
+     U2 `persisting` set, not sendable): ⇒ ledger `queued` if that write succeeded,
+     response **202 `unknown`**, halt; the next start drains it.
+   Caller-induced rebuilds (primary apply throws) exit with code **76**: the supervisor
+   relaunches but does not count them toward the storm limit; the worker appends
+   `{ts, reason: caller|system}` to `rebuilds.log` before exiting and reads it at start,
+   so **429** applies to writes when more than 5 caller rebuilds happened in the last 10
+   minutes (the window survives the restart because it lives in the file).
 
 **Rebuild** = `coordinator.halt()`, wait until both file chains are idle, verify the
 outbox state on disk, then **`process.exit(75)`**. Lazycat ignores `services.*.restart`
 (lzc-sdk 0.1 generates `RestartPolicy=no`; `ambrogio/deploy/lzc-manifest.template.yml:26-33`,
 confirmed on the NAS for every lzcapp container), so the container's PID 1 is a small
-**supervisor** (`entrypoint.sh`, same pattern as our cloudflared package): it relaunches
-the worker on exit code 75, stays down on any other code, keeps the rebuild timestamps in
-`/lzcapp/var/headless/rebuilds.log` and refuses to relaunch after **20 rebuilds in 24 h**
-(`rebuild_storm`, visible because `/v1/status` is then served by the supervisor itself
-with that reason). In-process re-activation is not used: re-activating the same space
+**supervisor** (`entrypoint.sh`, same pattern as our cloudflared package; the image adds
+`busybox-extras` for its tiny HTTP responder, as `lzc-cloudflared/docker/Dockerfile:4`
+does): it relaunches the worker on exit codes **75** (system rebuild) and **76** (caller
+rebuild), stays down on any other code (an uncaught exception exits 1), traps
+`TERM`/`INT` and forwards them to the worker (`trap 'kill -TERM "$child"; wait "$child";
+exit 143' TERM INT`, no relaunch on 137/143), and refuses to relaunch after **20 code-75
+exits in 24 h** read from `rebuilds.log` (`rebuild_storm`). After a storm or a non-rebuild
+exit the supervisor serves `/v1/status` itself (no bearer needed, no secrets in the body:
+`{state:"halted", reason}`), so callers get a reason rather than a refused connection; an
+operator clears a storm by deleting `rebuilds.log` and restarting the container. In-process re-activation is not used: re-activating the same space
 keeps the old transport and socket alive (`runtime-lifecycle-service.ts:176-179`,
 `active-space-session.ts:44-48`) and the shim already holds a cursor
 (`sync-transport.ts:1629-1656`, `database-sync.ts:110`).
@@ -352,12 +382,14 @@ time, which is Budgero's own semantics and identical in the web app.
   gates **REST entry only**: ops the pipeline issues itself (continuous-rules
   `rules.execute` after `transactions.add` / `addTransfer`, `app-runtime.ts:760-904`) are
   expected and not blocked.
-- `writes.ts` — **one write at a time** (global async lock). The `Idempotency-Key` is
-  looked up **before** the status gate: a same-key retry of a pending request waits for
-  its dequeues (up to 30 s) or returns 202; only a new key hits the gate. Writes return
-  503 while status is not `live` (bootstrapping, draining, halted) or while
-  `pendingCount > 0` — later writes must not be computed on a DB that contains an op the
-  server may still refuse. Flow per request:
+- `writes.ts` — **one write at a time** (global async lock). Order per request: take the
+  lock → look the `Idempotency-Key` up (under the lock, so two concurrent same-key
+  requests can't both see "no record") → if the record needs no execution (`acked`,
+  `failed`, `dropped`, or `queued` ops to wait for) answer from it, releasing the lock
+  while waiting → otherwise (no record, or `intent`-only ops) pass the **status gate**:
+  503 while status is not `live` (bootstrapping, draining, halted, `outbox_blocked`) or
+  while `pendingCount > 0` — later writes must not be computed on a DB that contains an
+  op the server may still refuse — then read a fresh `c` and execute. Flow per request:
   1. policy + argument guards (below);
   2. ledger record `intent` for **all n own ops** up front (so a retry can finish a request
      stopped at op k), with a fresh random **nonce**; cursor `c` recorded;
@@ -379,8 +411,9 @@ time, which is Budgero's own semantics and identical in the web app.
   "`queued` and not in the outbox ⇒ acked" is therefore valid only after that startup
   step has run.
 - `ledger.ts` — `ledger.json`. Record per `Idempotency-Key`: `{key, bodyHash, nonce, c,
-  ops: [{opId, own: bool, state: intent|queued|acked|nacked|failed|dropped,
-  entry?: serialized MutationPayload, result?, version?}]}` (`entry` is the full queue
+  generated: {transferId?}, ops: [{opId, own: bool, state:
+  intent|queued|acked|nacked|failed|dropped, entry?: serialized MutationPayload,
+  result?, version?}]}` (`entry` is the full queue
   entry as the wrapper sees it in `save()` — `id`, `op`, `args`, `v`, `timestamp`,
   `interfaces.ts:77-86`, `storage.ts:40-54` — not just the args, so startup put-back can
   rebuild it).
@@ -412,7 +445,8 @@ time, which is Budgero's own semantics and identical in the web app.
   `reconnection-service.ts:336-365`), so **no nack is final until the entry has left the
   disk**: the write path never answers 409 for a nack. Transient ⇒ ledger stays `queued`,
   `/v1/status.last_nack` set, 202 after the timeout. `invalid` ⇒ ledger `nacked`,
-  writes 503 `outbox_blocked`, reads `stale`, `outbox_divergent: true`; the entry keeps
+  writes **and reads** 503 `outbox_blocked` (the DB holds a write the server refused,
+  applied out of order: same state as a half-applied halt), `outbox_divergent: true`; the entry keeps
   being resent and nacked, and would be reapplied at every start, so **at startup, if the
   ledger says `nacked` for an entry still in `outbox.json`, the process stays up as
   `outbox_blocked` and does not drain or rebuild**. A nack on a follow-up id blocks the
@@ -551,7 +585,8 @@ export), `tokens` (one bearer per consumer, one per line, `name:role:token`, rol
 With no `config.json` the service idles, `/v1/status` says `not_configured`, and it never
 contacts the server. `TZ=Europe/Rome` and `BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}`
 come from the manifest (the same value the server's `WEBSOCKET_ALLOWED_ORIGINS` uses).
-These two are the **only** environment inputs. `local.env` is not used (build-time
+These two are the **only** environment inputs in production; the bench passes
+`--config-dir <path>` and `--bench` on the command line. `local.env` is not used (build-time
 substitution, not runtime config).
 
 ### REST API (v1)
@@ -559,7 +594,8 @@ substitution, not runtime config).
 Bearer from `tokens`, constant-time compare; token never echoed. Amounts in integer
 milliunits.
 
-- `GET /v1/status` — `not_configured|bootstrapping|draining|live|halted`, halted reason,
+- `GET /v1/status` — `not_configured|bootstrapping|draining|live|outbox_blocked|halted`
+  (halted reasons include `rebuild_storm`), `last_nack`, `rebuilds_24h`,
   cursor, stale, outbox size, `outbox_divergent`, versions. No secrets.
 - `GET /v1/accounts`, `/v1/category-groups`, `/v1/categories`, `/v1/payees`,
   `/v1/transactions?account=&category=&payee=&since=&until=&cleared=&limit=&offset=`,
@@ -568,7 +604,8 @@ milliunits.
 - `GET /v1/ops` — op policy: name, tier, format version (from `KNOWN_OP_CODES` +
   `OP_CODE_FORMAT_VERSIONS`).
 - `POST /v1/ops/{op}` — one op; guarded args → execute → ack → `{result, mutationId}`;
-  `Idempotency-Key` required. 200 / 202 pending / 409 nacked / 422 key reuse.
+  `Idempotency-Key` required. 200 (`reordered`/`rules_failed` flags) / 202 pending|blocked
+  / 403 policy / 409 dropped / 422 schema|failed|key reuse / 429 / 503.
 - `GET /v1/mutations/{id}` — ledger state of a mutation.
 - Convenience wrappers (each documents how many ops it issues): `POST /v1/transactions`
   (1), `PATCH /v1/transactions/{id}` (one `updateColumn` per field; `cleared` →
@@ -637,7 +674,10 @@ milliunits.
      (not an empty `live` DB); a remote mutation whose apply throws (the bench encrypts
      with `MutationEncryption` and sends a raw `mutation` frame with a **known** op that
      fails in apply, e.g. `transactions.updateColumn` with `columnName: 'cleared'`,
-     delivered while the headless is down so it arrives through catch-up; an unknown op
+     delivered while the headless is down and **with the peer stopped** (a later peer
+     write would upload a snapshot bound past the poison and activation would seed the
+     cursor from it, `space-activation-service.ts:288-291`), so it arrives through
+     catch-up; an unknown op
      would go to `haltForUpdate` instead, `sync-transport.ts:1219-1225`) ⇒ halt before any
      cursor move. The poison stays in that space's log forever: throwaway space only.
    Done when: a peer write appears in `GET /v1/transactions` within 5 s; a restart
@@ -671,9 +711,12 @@ milliunits.
    `handler/sync.go:485-535`) and their decrypted `{op, args}` equal the ledger payloads;
    the peer has one row; a write ordered behind a concurrent peer write returns
    `reordered: true` and triggers a rebuild, after which comparable tables equal the
-   peer's — forced deterministically by the bench proxy, which is **WebSocket-aware**: it
-   holds the headless's `mutation` frame until the peer's mutation is acked (the server
-   orders by arrival); a throwing op (e.g. `addTransfer` with equal accounts) returns 422
+   peer's — forced deterministically by the bench proxy, which is **WebSocket-aware**
+   (frames are plaintext JSON with only `encryptedPayload` opaque, no compression,
+   `websocket.go:96-114`, `sync-transport.ts:538-548`; headless ops are recognisable by the
+   `hdl_` prefix, any other id on the headless socket is a follow-up; **both** clients
+   connect through the proxy): it holds the headless's `mutation` frame until the peer's
+   `mutation_ack` passes (the server orders by arrival); a throwing op (e.g. `addTransfer` with equal accounts) returns 422
    and triggers a rebuild; same `Idempotency-Key` twice concurrently ⇒ one mutation; a restart with a
    non-empty outbox performs drain-and-rebuild and reaches `live` with comparable tables
    equal to the peer's; a key change at the peer halts the headless with no further
