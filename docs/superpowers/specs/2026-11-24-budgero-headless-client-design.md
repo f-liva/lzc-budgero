@@ -342,7 +342,7 @@ wait "$child"; exit 143' TERM INT`), and enforces budgets from `rebuilds.log`.
 | live restore | 77 | 50 → `restore_storm` | no |
 | primary apply throw (422) | 76 | not counted | 5 per 10 min ⇒ writes 429 |
 | config error, `outbox_in_readonly`, uncaught exception | 1 | stays down | — |
-| `TERM`/`INT` | 143 | stays down | — |
+| `TERM`/`INT` | 143 | stays down (the supervisor itself exits) | — |
 
 The **supervisor** appends every child exit `{ts, code, reason, outbox_size}` to
 `rebuilds.log` (codes 1/137/143 included, so `last_exit` and the milestone 3 gate see them);
