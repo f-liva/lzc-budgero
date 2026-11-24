@@ -453,7 +453,7 @@ Rules (a request's ops are all its own):
   refreshed) — but **never when an earlier op of the record is `failed`**; `failed`/`skipped`
   ops stay so ⇒ 200 `partial`; op 1 `failed` ⇒ 422;
 - any `unknown` ⇒ 202 `unknown` until startup resolves it;
-- any `nacked` ⇒ 202 `blocked` (from the record; the only write answer in `outbox_blocked`);
+- any `nacked` ⇒ 202 `blocked` (from the record);
   any `dropped` ⇒ **409** with per-op states in the body.
 
 `GET /v1/mutations/{id}`: `intent|queued → pending`, the rest 1:1, plus `version` and the
