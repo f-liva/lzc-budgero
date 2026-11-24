@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: draft v11, after review rounds 1–10 (twenty adversarial reviewers;
+Date: 24/11/2026. Status: draft v12, after review rounds 1–11 (twenty-two adversarial reviewers;
 every critical/important finding verified in code and folded in below).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet; we start anyway).
 Code references and the pin: upstream tag **v1.22.1 = `e40723e`** (also master HEAD on 24/11).
@@ -243,12 +243,12 @@ reason, served by the supervisor), config. Nothing else.
   `mutation-dispatch-service.ts:76`). **One promise chain per file**, content snapshotted
   at call time, unique temp names (the web adapter serialises for the same reason,
   `web-adapter.ts:555-566`). The wrapper also notices ids that *disappear* from the queue
-  between saves: in the headless that is the only place an entry leaves the queue
-  (`clear()`/`setQueue()` exist, `offline-queue.ts:272-283`, reachable only from the app
-  UI; the wrapper halts if `QueueStorage.clear` is ever called),
-  (`OfflineQueue.ackMutation`, `offline-queue.ts:154-166`), reached both by `mutation_ack`
+  between saves. In the headless the only place an entry leaves the queue is
+  `OfflineQueue.ackMutation` (`offline-queue.ts:154-166`), reached both by `mutation_ack`
   and by the implicit ack when our own mutation comes back via catch-up/broadcast
-  (`runtime-lifecycle-service.ts:196-201`), and it is what the write path waits on.
+  (`runtime-lifecycle-service.ts:196-201`); that observation is what the write path waits
+  on. `clear()`/`setQueue()` exist (`offline-queue.ts:272-283`) but are reachable only
+  from the app UI; the wrapper halts (`queue_cleared`) if `QueueStorage.clear` is called.
 - **`ledger.ts`** — `ledger.json`, same write discipline, same chain rule (see Writes).
 
 **Bootstrap invariant: `live` only with DB = snapshot + log in server order, own ops
@@ -265,12 +265,25 @@ included at their server position.**
 3. If the outbox was non-empty at start, the reapplied entries were applied **before**
    catch-up, i.e. out of server order (`:363-377`). So: status `draining`, wait until the
    outbox drains (every entry acked, or finally nacked: see Nack), then **rebuild**.
-4. **Every** live restore while `live` ⇒ `draining`, then rebuild, whatever `queuedCount`
-   is: `downloadAndRestore` does not wait for a running write (`database-sync.ts:423-449`,
+4. **Every** live restore ⇒ `draining`, then rebuild, whatever `queuedCount` is, and the
+   restore must **wait for a running write**: U3 adds `beforeRestore(): Promise<void>`,
+   awaited at the top of `downloadAndRestore` and `notifyDatabaseRestored`
+   (`database-sync.ts:423-449, 416`); the headless flips to `draining` synchronously and
+   then waits for the global write lock (the request in flight finishes through dequeue
+   or its 202 timeout). Otherwise a write that read absolute totals before the swap
+   would apply them on the restored DB and send them to every device with the ordering
+   check blind (an out-of-band blob is not in the log). Once a restore has started it
+   always ends in a rebuild, even if the hook chain throws (`:442-449` swallows throws).
+   Why every restore: `downloadAndRestore` does not wait for a running write (`database-sync.ts:423-449`,
    `beginOperation` only holds uploads, `:141-158`), so an op mid-apply at restore time is
    neither in the queue for reapply nor re-applied by catch-up (its echo is an implicit
    ack, `runtime-lifecycle-service.ts:196-201`), and an out-of-band blob is not in the log,
-   so the ordering check can't see it. Restores are rare (peer import or DB restore).
+   so the ordering check can't see it. Restores are **not** rare: besides a peer import or
+   DB restore, every offline→online transition downloads the latest blob when the
+   server's version is newer and the headless has no local changes
+   (`reconnection-service.ts:194-200`, `runtime-coordinator.ts:672-690`), i.e. after any
+   connectivity blip that coincided with a phone upload. Restore-triggered rebuilds
+   therefore have their own exit code and budget (see the table).
 5. **Live ordering check, per request, in the dequeue observer.** A request issues `k ≥ 1`
    ops: its own (one per `/v1/ops`, n for a `PATCH`) plus the continuous-rules follow-ups
    the U6 pipeline issues with random ids right after the primary is sent
@@ -313,7 +326,10 @@ included at their server position.**
      `rules_failed: true`, ledger primary `acked`, follow-up `failed`; then rebuild (exit
      76: a user-configured rule that throws on every add must not count as a storm). If
      the follow-up's error came from its own `outbox.add`, mark it `unknown` (the entry
-     may still be written by a later save and drain). The hook also covers the `listRules`
+     may still be written by a later save and drain). The outbound WS shim **holds every
+     non-`hdl_` frame until the request's primary is acked**: otherwise a transient nack of
+     the primary lets a follow-up `rules.execute` land first and run on every device
+     before its transaction exists (`mutations.go:111-175`). The hook also covers the `listRules`
      catch and the `!services` return (`app-runtime.ts:851, 857`), outside the range
      `:875-903`.
      A 422 here would make a caller re-create the transaction under a new key: doubled
@@ -323,24 +339,27 @@ included at their server position.**
      response **202 `unknown`**, halt; the next start drains it.
    Caller-induced rebuilds (primary apply throws) exit with code **76**: the supervisor
    relaunches but does not count them toward the storm limit; the worker appends
-   `{ts, reason: caller|system}` to `rebuilds.log` before exiting and reads it at start,
+   its record to `rebuilds.log` (shape in the exit-code table) before exiting and reads it at start,
    so **429** applies to writes when more than 5 caller rebuilds happened in the last 10
    minutes (the window survives the restart because it lives in the file).
 
 **Rebuild** = `coordinator.halt()`, wait until both file chains are idle, verify the
 outbox state on disk, then **`process.exit(75)`**. Lazycat ignores `services.*.restart`
 (lzc-sdk 0.1 generates `RestartPolicy=no`; `ambrogio/deploy/lzc-manifest.template.yml:26-33`,
-confirmed on the NAS for every lzcapp container), so the container's PID 1 is a small
-**supervisor** (`entrypoint.sh`, same pattern as our cloudflared package; the image adds
+confirmed on the NAS for every lzcapp container), so the container's entrypoint (a child
+of Lazycat's `lzcinit` when `setup_script` is used, as on `cloudlazycatapppostiz-elasticsearch-1`)
+is a small **supervisor** (`entrypoint.sh`, same pattern as our cloudflared package; the image adds
 `busybox-extras` for its tiny HTTP responder, as `lzc-cloudflared/docker/Dockerfile:4`
 does): it relaunches the worker on exit codes **75** (system rebuild) and **76** (caller
 rebuild), stays down on any other code (an uncaught exception exits 1), traps
 `TERM`/`INT` and forwards them to the worker (`trap 'kill -TERM "$child"; wait "$child";
-exit 143' TERM INT`, no relaunch on 137/143), and refuses to relaunch after **20 code-75
-exits in 24 h** read from `rebuilds.log` (`rebuild_storm`). After a storm or a non-rebuild
-exit the supervisor serves `/v1/status` itself (no bearer needed, no secrets in the body:
-`{state:"halted", reason}`), so callers get a reason rather than a refused connection; an
-operator clears a storm by deleting `rebuilds.log` and restarting the container. In-process re-activation is not used: re-activating the same space
+exit 143' TERM INT`, no relaunch on 137/143; whether `lzcinit` forwards TERM is a
+milestone 3 check), and does not relaunch the **21st** code-75 exit within 24 h read from
+`rebuilds.log` (`rebuild_storm`). After a storm or a non-rebuild exit the supervisor
+serves `/healthz` and `/v1/status` itself (no bearer, no secrets:
+`{state:"halted", reason}`), so callers get a reason rather than a refused connection; it
+writes `exit:<code>` as the reason when the worker left none. An operator clears a storm
+by deleting `rebuilds.log` and restarting the container. In-process re-activation is not used: re-activating the same space
 keeps the old transport and socket alive (`runtime-lifecycle-service.ts:176-179`,
 `active-space-session.ts:44-48`) and the shim already holds a cursor
 (`sync-transport.ts:1629-1656`, `database-sync.ts:110`).
@@ -364,7 +383,8 @@ time, which is Budgero's own semantics and identical in the web app.
   `node-sqljs-adapter.ts:45-47`, so the image keeps that layout; failure logs redacted) —
   see Durability.
 - `http.ts` — port of the app's `blobApi` (download + `getDatabaseState` only; **no
-  upload function exists in the headless**), `spacesApi`, `checkApiHealth` (`HEAD
+  upload function in `http.ts`**; the coordinator's required `uploadBlob` dependency,
+  `runtime-coordinator-types.ts:20`, is the throwing stub named in U3), `spacesApi`, `checkApiHealth` (`HEAD
   /api/v1/health`, `health.ts:9-20`; a required coordinator dependency used by
   `DatabaseSync.download`, `database-sync.ts:346-353`, and the connectivity monitor) and
   `getProfile` (`GET /profile`, called by `space-catalog-service.ts:112`), without
@@ -427,7 +447,7 @@ time, which is Budgero's own semantics and identical in the web app.
   step has run.
 - `ledger.ts` — `ledger.json`. Record per `Idempotency-Key`: `{key, bodyHash, nonce, c,
   generated: {transferId?}, ops: [{opId, own: bool, state:
-  intent|queued|acked|nacked|failed|dropped, entry?: serialized MutationPayload,
+  intent|queued|acked|nacked|failed|dropped|unknown, entry?: serialized MutationPayload,
   result?, version?}]}` (`entry` is the full queue
   entry as the wrapper sees it in `save()` — `id`, `op`, `args`, `v`, `timestamp`,
   `baseVersion`, `spaceId`, `interfaces.ts:77-86`, `storage.ts:40-54` — the whole object,
@@ -438,7 +458,9 @@ time, which is Budgero's own semantics and identical in the web app.
   `sync-transport.ts:1044`). One request may issue several ops (a `PATCH` of n fields = n
   `updateColumn` ops). On a request:
   - no record ⇒ proceed;
-  - record with a different `bodyHash` ⇒ **422**;
+  - record with a different `bodyHash` ⇒ **422** (`bodyHash` = sha256 of method + path +
+    canonical JSON of the parsed body: sorted keys, no whitespace; a re-serialised retry
+    must not look like key reuse, or the caller would retry under a new key);
   **Retry decisions look at own ops only (`own: true`); follow-up states never decide
   the status code, they only set `rules_failed`/`rules_dropped` on the stored 200.**
   - all own ops `acked` ⇒ 200 with stored results (`result: null` for ops acked by a drain
@@ -450,6 +472,8 @@ time, which is Budgero's own semantics and identical in the web app.
   - an op `intent` only (crash before the ledger `queued` write, which precedes the
     outbox write, so the server has nothing under that id) ⇒ execute again with the
     **same opId**; `prepare` runs again, which is correct;
+  - an own op `unknown` (its `outbox.add` threw) ⇒ 202 `unknown` until startup resolves it
+    (present in `outbox.json` → drains → `acked`; absent → `failed`);
   - first own op `failed` ⇒ 422 with the stored reason; an own op `nacked` ⇒ 202 `blocked`
     while it is still in the outbox (this branch answers from the record, before the
     gate), **409 only once `dropped`** (see Nack); an own op `dropped` ⇒ 409.
@@ -477,8 +501,9 @@ time, which is Budgero's own semantics and identical in the web app.
   directly). A nack on a follow-up id blocks writes the same way but never changes the
   request's status code (the primary landed). An empty-id nack (`client.go:149`) sets `last_nack`
   only. Operator action: `POST /v1/admin/outbox/{id}/drop` (role `admin`, see Config) performs `halt()` if a coordinator exists,
-  waits for the file chains, removes the entry from `outbox.json`, writes ledger
-  `dropped`, exits 75 for a rebuild; the caller's next retry gets **409**. Dropping on a
+  waits for the file chains, writes ledger `dropped` **first**, then removes the entry from
+  `outbox.json`, exits 75 for a rebuild (startup step 4 also removes from `outbox.json`
+  any id the ledger marks `dropped`, closing the crash window between the two writes); the caller's next retry gets **409**. Dropping on a
   running queue is not possible (the in-memory queue rewrites the file on the next ack,
   `offline-queue.ts:154-166`).
 - `GET /v1/mutations/{id}` — `pending|acked|nacked|failed|dropped|unknown`, with `version`
@@ -492,7 +517,8 @@ write routes, the WebSocket shim rejects `mutation` frames, `allowUpload` is `()
 and `uploadBlob` is the rejecting stub. In write mode only the first two change. A
 leftover outbox in read-only mode would be reapplied and resent at start, and the shim's
 throw would close the socket in a loop (`sync-transport.ts:549-560`): read-only therefore
-refuses to start with a non-empty `outbox.json` (status `halted:outbox_in_readonly`). A test sends
+refuses to start with a non-empty `outbox.json` (exit 1, reason `outbox_in_readonly`; to
+drain or drop it the operator sets `readOnly: false` first). A test sends
 every frame type in read-only mode and expects a throw for all but `catch_up_request`.
 
 ### Halting
@@ -501,12 +527,14 @@ Triggers: `FormatTooNewError`, `UnknownOpCodeError`, HTTP 426, `onRemoteApplyFai
 or password change, server version ≠ bundled version or `build_version`
 `unknown`/unparsable (checked before activation and on every reconnect via
 `GET /api/v1/version/latest`, compared to `package.json` of the pinned tag). Action:
-`coordinator.halt(reason)` (U3); `/v1/status` = `halted:<reason>`; **reads and writes
+`coordinator.halt(reason)` (U3); `/v1/status` → `{state:"halted", reason}`; **reads and writes
 return 503** (the in-memory DB may be half-applied or stale, and there is no "last good
 file" to fall back to). Restart only by operator action: a container restart rebuilds
 from the server. Never auto-reload, never re-key.
 
-Reads: 200 + `stale: true` in `bootstrapping`; **503 `draining`** in `draining` (the DB
+Reads: 503 `bootstrapping` until the snapshot is restored, then 200 + `stale: true` until
+catch-up has settled (only when the outbox was empty: with a non-empty outbox the state
+is `draining`, not `bootstrapping`); **503 `draining`** in `draining` (the DB
 is out of server order by definition) and 503 in `outbox_blocked`/`halted`. Reads are not
 serialised with remote applies: a read can observe an op mid-apply; acceptable for
 Ambrogio, stated in the API docs.
@@ -622,13 +650,20 @@ substitution, not runtime config).
 2. Load `tokens` (`name:role:token`, roles `read|write|admin`; a malformed line is a config
    error). Role matrix: `read` → GET routes; `write` → `read` + write routes; `admin` →
    `write` + `/v1/admin/*`. A role mismatch is **403 `role`** (distinct from 403 `policy`).
-   `/v1/status` needs any valid bearer when served by the worker; the supervisor's copy
-   needs none and carries no secrets.
+   `GET /healthz` is unauthenticated (body `{state, reason}` only) and is what the manifest
+   health check and Ambrogio's liveness probe use; `/v1/status` needs any valid bearer
+   when served by the worker (the supervisor's copy needs none, same body as `/healthz`).
+   HTTP codes: `/healthz` returns 200 in `live`, `bootstrapping`, `draining`,
+   `not_configured`; 503 in `halted`, `outbox_blocked`, `shutting_down` (so Lazycat shows
+   a halted headless as unhealthy; verifying what Lazycat does with an unhealthy
+   secondary service is a milestone 3 check).
 3. Read `rebuilds.log` (for `rebuilds_24h` and the 429 window).
-4. Ledger put-back: every `queued` op missing from `outbox.json` is appended to it.
-5. Read-only check: `readOnly` and non-empty outbox ⇒ `reason=outbox_in_readonly`, exit 1.
-6. Nacked check: a ledger `nacked` op still in `outbox.json` ⇒ state `outbox_blocked`,
-   serve `/v1/status`, `/v1/mutations/*`, `/v1/admin/*` only; **no activation**.
+4. Ledger reconciliation: every `queued` op missing from `outbox.json` is appended to it;
+   every `dropped` id still present is removed.
+5. Nacked check: a ledger `nacked` op still in `outbox.json` ⇒ state `outbox_blocked`,
+   serve `/healthz`, `/v1/status`, `/v1/mutations/*`, `/v1/admin/*` only; **no activation**
+   (runs before the read-only check so the admin drop is reachable).
+6. Read-only check: `readOnly` and non-empty outbox ⇒ `reason=outbox_in_readonly`, exit 1.
 7. Version check (`GET /version/latest`, unauthenticated, `routes.go:30`) ⇒ mismatch or
    `unknown` ⇒ halt `version_mismatch`.
 8. Login.
@@ -643,7 +678,7 @@ Shutdown on `TERM`/`INT` (forwarded by the supervisor): stop accepting requests 
 | Trigger | Exit | Counted for storm (20/24 h) | Counted for 429 (5/10 min) |
 |---|---|---|---|
 | `reordered` (ordering check) | 75 | yes | no |
-| live restore while `live` | 75 | yes | no |
+| live restore (`beforeRestore`) | 77 | separate budget: 50/24 h | no |
 | drain finished after non-empty outbox | 75 | yes | no |
 | admin drop | 75 | yes | no |
 | primary apply throw (422) | 76 | no | yes |
@@ -651,14 +686,16 @@ Shutdown on `TERM`/`INT` (forwarded by the supervisor): stop accepting requests 
 | config error, `outbox_in_readonly`, uncaught exception | 1 | stays down | — |
 | `TERM`/`INT` | 143 | stays down | — |
 
-The worker appends `{ts, code, reason}` to `rebuilds.log` before exiting and writes the
-last `reason` to the `reason` file; the supervisor relaunches on 75/76 only.
+The worker appends `{ts, code, reason}` to `rebuilds.log` before exiting (and `{ts,
+code:"halt", reason}` when it halts without exiting, so the milestone 3 "zero halts" gate
+is checkable) and writes the last `reason` to the `reason` file; the supervisor relaunches
+on 75/76/77 only.
 
 ### `/v1/status` schema
 
 ```json
 {"state":"not_configured|bootstrapping|draining|live|outbox_blocked|halted|shutting_down",
- "reason": "version_mismatch|format_too_new|unknown_op|remote_apply_failed|key_changed|rebuild_storm|outbox_in_readonly|config:<field>|null",
+ "reason": "version_mismatch|protocol_426|format_too_new|unknown_op|remote_apply_failed|key_changed|password_changed|bootstrap_failed:<download|local_fallback|decrypt|migrations>|outbox_write_failed|queue_cleared|rebuild_storm|outbox_in_readonly|config:<field>|exit:<code>|null",
  "stale": true, "cursor": 12345, "outbox_size": 0, "outbox_divergent": false,
  "last_nack": {"id":"hdl_…","code":"storage_error","at":"2026-11-24T10:00:00Z"},
  "rebuilds_24h": 1, "versions": {"server":"1.22.1","bundled":"1.22.1"}}
@@ -668,15 +705,19 @@ Write responses: 200 `{results:[…], mutationIds:[…], reordered?, rules_faile
 
 ### Image and manifest
 
-- Build stage (fork): `pnpm install --frozen-lockfile` with `packages/headless` added to the
-  workspace and to the lockfile (`ws`, `esbuild`), then `esbuild` → `dist/headless.mjs`
-  with `sql.js` left **external**.
+- Build stage: clone `f-liva/budgero` at the **fork tag** `headless-v1.22.1-<n>` (branch
+  `feat/headless-client` rebased on upstream `v1.22.1`; upstream's own tag has no
+  `packages/headless`), `pnpm install --frozen-lockfile --prod=false` (sql.js is a
+  **devDependency** of `core`, `core/package.json:52-62`, installed only with
+  `--prod=false`) with `packages/headless` in the workspace and lockfile (`ws`, `esbuild`),
+  then `esbuild` → `dist/headless.mjs` with `sql.js` left **external** and a
+  `createRequire` banner (CommonJS deps such as `ws`/`debug` inside an ESM bundle).
 - Runtime stage: `node:22-alpine` + `busybox-extras` (supervisor's HTTP responder) +
-  `dist/` + `node_modules/sql.js/dist` copied to **`/app/node_modules/sql.js/dist`**, and
-  the worker runs with `cwd=/app` (`NodeSqlJsAdapter` loads from
-  `process.cwd()/node_modules/sql.js/dist`, `node-sqljs-adapter.ts:45-47`; under pnpm
-  `sql.js` is a dependency of `core` only, `core/package.json:62`, not hoisted, so it is
-  copied explicitly). Runs as uid 1001; the manifest's `setup_script` chowns
+  `dist/` + the **whole** `sql.js` package copied dereferenced
+  (`cp -rL packages/core/node_modules/sql.js /app/node_modules/sql.js`: the bare `import
+  'sql.js'` in `node-sqljs-adapter.ts:1` needs its `package.json`, and the wasm is loaded
+  from `process.cwd()/node_modules/sql.js/dist`, `:45-47`), worker `cwd=/app`. Runs as
+  uid 1001; the manifest's `setup_script` chowns
   `/lzcapp/var/headless` to 1001 so mode-600 secrets are readable (Lazycat runs
   containers as root unless told otherwise).
 - Manifest service:
@@ -689,17 +730,34 @@ Write responses: 200 `{results:[…], mutationIds:[…], reordered?, rules_faile
     environment:
       - TZ=Europe/Rome
       - BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}
+    setup_script: mkdir -p /lzcapp/var/headless && chown -R 1001:1001 /lzcapp/var/headless
     health_check:
-      test: [CMD, wget, -qO-, http://localhost:8787/v1/status]
+      test: [CMD, wget, -qO-, http://localhost:8787/healthz]
+      start_period: 120s
   ```
-  The Dockerfile lives in `lzc-budgero/docker/headless/` and builds from the fork at the
-  pinned tag (a `git clone --branch` of `f-liva/budgero`), separate from the server
-  image, which stays the upstream release image.
+  (`user` + `setup_script` as in `lzc-postiz/postiz-lzc/lzc-manifest.yml:34-35`, live on the
+  NAS.) The Dockerfile lives in **`lzc-budgero/docker/headless/Dockerfile`** and clones the
+  fork tag above; it is a separate image from the server's, which is our thin wrapper
+  `fliva/lzc-budgero` over the upstream release image (`lzc-budgero/docker/Dockerfile`).
 
 ### REST API (v1)
 
 Bearer from `tokens`, constant-time compare; token never echoed. Amounts in integer
-milliunits.
+milliunits. Request bodies: `POST /v1/ops/{op}` takes the op's args object **directly**
+(what the registry's `execute(args)` receives, minus the stripped keys); wrappers take the
+flat fields named below. `Idempotency-Key`: 16–128 chars, `[A-Za-z0-9_-]`. Tokens are
+generated by the operator (`openssl rand -base64 32`) and written to `tokens`. Logs: JSON
+lines on stdout (`{ts, level, msg, state, mutationId?}`), through the redactor.
+
+Example (Ambrogio adds an expense):
+```http
+POST /v1/transactions
+Authorization: Bearer <write token>
+Idempotency-Key: amb-2026-11-24-7f3a
+{"accountId": 139, "categoryId": 163, "date": "2026-11-24", "outflow": 12500, "payee": "Esselunga", "memo": "spesa"}
+→ 200 {"results":[{"id": 8631}], "mutationIds":["hdl_…"]}
+```
+
 
 - `GET /v1/status` — `not_configured|bootstrapping|draining|live|outbox_blocked|halted`
   (halted reasons include `rebuild_storm`), `last_nack`, `rebuilds_24h`,
@@ -712,7 +770,7 @@ milliunits.
   `OP_CODE_FORMAT_VERSIONS`).
 - `POST /v1/ops/{op}` — one op; guarded args → execute → ack → `{result, mutationId}`;
   `Idempotency-Key` required. 200 (`reordered`/`rules_failed` flags) / 202 pending|blocked
-  |unknown / 403 policy|role / 409 dropped / 422 schema|failed|key reuse / 429 / 503.
+  |unknown / 403 policy|role / 409 dropped / 422 schema|failed|key reuse / 429 / 503; state list in the status schema (incl. `shutting_down`).
 - `GET /v1/mutations/{id}` — ledger state of a mutation.
 - Convenience wrappers (each documents how many ops it issues): `POST /v1/transactions`
   (1), `PATCH /v1/transactions/{id}` (one `updateColumn` per field; `cleared` →
@@ -769,7 +827,9 @@ milliunits.
      `snapshot_download`, `create_database`, `before_catchup_settled`, `ws_before_apply`,
      and in milestone 2 `after_ledger_intent`, `after_ledger_queued_before_rename`,
      `after_outbox_add_before_send`, `after_send_before_ack`, `in_dequeuing_save`.
-     Headless as a child process, `SIGKILL` at point k for every k, then
+     Headless as a child process run through `entrypoint.sh` (so 75/76/77 relaunch as in
+     production, with `rebuilds.log` in the bench config dir), `SIGKILL` at point k for
+     every k, then
      100 random kills. Oracle after each restart: status reaches `live`, and the headless
      DB equals the peer's under the upstream comparator `dumpDb(adapter, {sequences:
      true, crossDevice: true})`. `dumpDb` lives in the app's vitest harness
@@ -844,11 +904,12 @@ milliunits.
    21 forced rebuilds in the bench ⇒ `rebuild_storm`; every argument guard has a rejecting test (unknown key, foreign-budget id
    on every id path, `opClock`, `transferId`, `importIdentities`, `accounts.update` with
    anything but `name`, `from == to`, over-assign without the flag).
-3. **Deploy.** NAS upgrade to v1.22.1 (blob + DB backup first). Headless image built from
-   the fork's pnpm workspace (stage 1 of `selfhost.Dockerfile` extended with
-   `packages/headless`), mirrored to the Lazycat registry like the server image;
+3. **Deploy.** NAS upgrade to v1.22.1 (blob + DB backup first). Headless image built as
+   in §Image and manifest, mirrored to the Lazycat registry like the server image;
    `headless` service in the manifest bound to `/lzcapp/var/headless`; reachability from
-   the Ambrogio container verified; confirm the NAS server doesn't set `APP_VERSION`.
+   the Ambrogio container verified; confirm the NAS server doesn't set `APP_VERSION`;
+   verify that `lzcinit` forwards TERM to the entrypoint and what Lazycat does with an
+   unhealthy `headless` service.
    Real space **read-only until**: 7 days of `live` with `GET /v1/months/{current}`
    matching the web app's figures on 3 spot checks and zero halts; then `readOnly: false`.
 4. **Ambrogio adapter** — separate project in the Ambrogio repo. Not designed here.
