@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: draft v7, after review rounds 1–6 (twelve adversarial reviewers;
+Date: 24/11/2026. Status: draft v8, after review rounds 1–7 (fourteen adversarial reviewers;
 every critical/important finding verified in code and folded in below).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet; we start anyway).
 Code references and the pin: upstream tag **v1.22.1 = `e40723e`** (also master HEAD on 24/11).
@@ -23,7 +23,10 @@ Round 6 added the last piece: a wrong in-memory DB can still reach other devices
 absolute totals computed locally). So the headless must never be `live` with a DB that
 is not exactly snapshot + log in server order: it accepts only a clean server bootstrap,
 and whenever it had to replay its own outbox it drains the outbox and **bootstraps a
-second time** before serving.
+second time** before serving. Round 7 added the live-ordering check: a write that the
+server orders behind a concurrent peer write (ack version ≠ expected) makes the local
+DB diverge in row ids and absolute totals, exactly as it does in the web app; the
+headless detects it from the ack version and rebuilds before the next write.
 
 ## Why
 
@@ -183,10 +186,20 @@ post-restore migrations and catch-up correctly); we keep it and add injection po
   - `onRemoteApplyFailed?(mutation, error)`, called at the top of both catch blocks
     (catch-up `sync-transport.ts:1226-1244`, live `:1097-1107`) **before** any cursor move,
     quarantine or snapshot fallback.
-  - `onMutationNacked?(mutationId, reason)` from `handleMutationNack`
-    (`sync-transport.ts:974`, id = `msg.id ?? msg.mutationId`). Acks need no hook: the
-    headless's `QueueStorage` observes dequeues (see Durability); the existing
-    `onMutationAck` dependency (`interfaces.ts:161`) is already wired to `ackMutation`.
+  - `onMutationAck(mutationId, version)`: the existing dependency (`interfaces.ts:161`) is
+    wired at `runtime-context-factory.ts:221` as `(id) => offlineQueue.ackMutation(id)` and
+    drops the version; U3 passes it through, so the headless learns the **log position**
+    the server gave each of its ops (needed for the ordering check). Dequeues are still
+    observed in `QueueStorage` (implicit acks via catch-up never reach this handler,
+    `runtime-lifecycle-service.ts:196-201`).
+  - `onMutationNacked?(mutationId, code, reason)` from `handleMutationNack`
+    (`sync-transport.ts:974`, id = `msg.id ?? msg.mutationId`, possibly empty for an
+    unparseable frame, `client.go:149`).
+  - `onDatabaseRestored?(queuedCount)` after `reapplyQueueAfterRestore` on every live
+    restore (`runtime-context-factory.ts:178-192`, `runtime-coordinator.ts:656-676`).
+  - `onFollowUpError?(op, error)` in the U6 pipeline where continuous-rules failures are
+    swallowed today (`app-runtime.ts:875-903`): `AppRuntime` keeps logging, the headless
+    rebuilds.
   - `RuntimeCoordinator.halt(reason)`: stops sync, reconnection and connectivity, clears
     the coordinator timers (`remoteBlobRetryTimer`, `runtime-coordinator.ts:635-638`),
     makes `upload`/`downloadAndRestore` no-ops behind a halted flag. No flush: there is
@@ -223,38 +236,66 @@ What survives a restart: `outbox.json`, `ledger.json`, config. Nothing else.
   (`runtime-lifecycle-service.ts:196-201`), and it is what the write path waits on.
 - **`ledger.ts`** — `ledger.json`, same write discipline, same chain rule (see Writes).
 
-**Bootstrap invariant: `live` only with DB = snapshot + log in server order.**
-1. Activation runs the stock path with `hasLocalDatabase: async () => false` and no stored
-   cursor: snapshot download → `createDatabase` → `reapplyQueueAfterRestore` → connect →
-   catch-up (`space-activation-service.ts:272-391`).
-2. The `onActivated` outcome (`:95-115`) must be `server_snapshot`; `fresh` is accepted
-   only when the blob download answered 404 (new space). Anything else (download error ⇒
-   upstream silently continues on an **empty** DB, `:310-322`; local fallback; decryption
-   error) ⇒ **halt**. Status `bootstrapping` until catch-up has settled.
+**Bootstrap invariant: `live` only with DB = snapshot + log in server order, own ops
+included at their server position.**
+1. Activation runs the stock path with `hasLocalDatabase: async () => false` and a fresh
+   in-memory storage shim: snapshot download → `createDatabase` →
+   `reapplyQueueAfterRestore` → connect → catch-up (`space-activation-service.ts:272-391`).
+2. The `onActivated` report must have `ok === true` and path `server_snapshot`
+   (`:95-123`); `fresh` is accepted only when `downloadBlob` returned null, i.e. the blob
+   answered 404 (new space). Anything else (download error ⇒ upstream silently continues
+   on an **empty** DB, `:310-322`; local fallback; decryption error; a swallowed
+   `runMigrations` failure, `:351-364`, detected by wrapping the loader) ⇒ **halt**.
+   Status `bootstrapping` until catch-up has settled.
 3. If the outbox was non-empty at start, the reapplied entries were applied **before**
-   catch-up, i.e. out of server order (`:363-377`); the DB may differ from every other
-   device. So: wait until the outbox drains (every entry acked or nacked), then **discard
-   the DB and bootstrap again** with an empty outbox. Only the second bootstrap goes
-   `live`. A nacked entry never drains: see Nack.
-4. Any live restore (catch-up fallback, out-of-band blob) followed by an outbox reapply
-   triggers the same drain-and-rebuild before writes are accepted again.
-5. A local `execute` that throws leaves partial writes (`op-code-registry.ts:314-319`) ⇒
-   **halt** (the DB is no longer snapshot + log).
+   catch-up, i.e. out of server order (`:363-377`). So: status `draining`, wait until the
+   outbox drains (every entry acked, or finally nacked: see Nack), then **rebuild**.
+4. `onDatabaseRestored(queuedCount > 0)` after a live restore ⇒ `draining`, then rebuild.
+5. **Live ordering check.** Before each write the cursor `c` is read (writes are serialised
+   and only accepted when catch-up has settled and nothing is buffered). The server
+   assigns the op its position `v` (`onMutationAck`). If `v ≠ c + 1`, a peer mutation was
+   ordered before ours: locally our op ran first, so autoincrement row ids and any
+   absolute totals (`upsertAssignment`, move money, `updateColumn`) now differ from every
+   other device (`id-reuse.ts:1-28`, `reconnection-service.ts:261`; the web app has the
+   identical race and lives with it). The write still returns 200 (the server has the
+   op, every other device applies it), with `reordered: true` and, for creates, a note
+   that the returned row ids are **not valid across devices** until the next read after
+   rebuild; then status `draining` → rebuild before any further write.
+6. A throw from `coordinator.executeMutation` (op validation, e.g. "accounts must differ",
+   split sum, unsupported column; or `outbox.add` failing after the in-memory push,
+   `offline-queue.ts:68-69`) ⇒ **422** to the caller, ledger op `failed`, and a rebuild
+   (partial writes are in memory, `op-code-registry.ts:314-319`; nothing reached the
+   server unless `outbox.add` partially succeeded, in which case the entry drains during
+   the next bootstrap and the ledger records it as `acked` with `result: null`). Not a
+   halt: bad input from Ambrogio is routine, not a fault. `onFollowUpError` ⇒ rebuild too.
+
+**Rebuild** = `coordinator.halt()`, wait until both file chains are idle, verify the
+outbox state on disk, then **`process.exit(0)`**; the container restart policy
+(`restart: always`) starts the process, which bootstraps from the server. In-process
+re-activation is not used: re-activating the same space keeps the old transport and
+socket alive (`runtime-lifecycle-service.ts:176-179`, `active-space-session.ts:44-48`) and
+the shim already holds a cursor (`sync-transport.ts:1629-1656`, `database-sync.ts:110`).
+`/v1/status` exposes `rebuilds_today`; more than 20 in an hour ⇒ halt
+(`rebuild_storm`), which is a signal for the operator, not a self-heal loop.
 
 With that invariant, a startup "reconciliation" of the outbox against `mutation_history`
-is unnecessary and is **not** done (there is no hook before `reapplyQueueAfterRestore`
-anyway, and `mutation_history` is capped at ~500/budget and gated on a resolvable
-budget id, so it proves nothing). Double application of an acked-but-not-dequeued entry
-during the first bootstrap is harmless: that DB is thrown away.
+is unnecessary and is **not** done (`mutation_history` is capped at ~500/budget and
+gated on a resolvable budget id, so it proves nothing). Double application of an
+acked-but-not-dequeued entry during a bootstrap that will be discarded is harmless.
 
 Why this is enough: nothing the headless does locally can reach another device except
 through the mutations it sends; those are produced by the app's own pipeline (U6) from
-guarded args against a DB that is, by construction, what every other device has.
+guarded args against a DB that is either what every other device has, or known not to
+be, in which case no further write happens until it is rebuilt. The residual: the
+lost-update race between two devices editing the same absolute value at the same
+time, which is Budgero's own semantics and identical in the web app.
 
 ### Platform pieces (packages/headless/src/platform)
 
-- `storage.ts`, `queue-storage.ts`, `database.ts` (bare `NodeSqlJsAdapter`, wasm by
-  explicit path, failure logs redacted) — see Durability.
+- `storage.ts`, `queue-storage.ts`, `database.ts` (bare `NodeSqlJsAdapter`; it loads sql.js
+  from `process.cwd()/node_modules/sql.js/dist` and ignores options,
+  `node-sqljs-adapter.ts:45-47`, so the image keeps that layout; failure logs redacted) —
+  see Durability.
 - `http.ts` — port of the app's `blobApi` (download + `getDatabaseState` only; **no
   upload function exists in the headless**) and `spacesApi`, without Clerk/zustand/env:
   headers `X-Budgero-Protocol`, `X-Client-Session`, bearer; reads `X-Mutation-Version`,
@@ -286,47 +327,64 @@ guarded args against a DB that is, by construction, what every other device has.
   `rules.execute` after `transactions.add` / `addTransfer`, `app-runtime.ts:760-904`) are
   expected and not blocked.
 - `writes.ts` — **one write at a time** (global async lock); writes return 503 while
-  status is not `live` (bootstrapping, draining, halted) or while the outbox holds a
-  nacked entry. Flow per op:
+  status is not `live` (bootstrapping, draining, halted) or while an own op is still
+  `queued` (pending ack after a 202) — later writes must not be computed on a DB that
+  contains an op the server may still refuse. Flow per op:
   1. policy + argument guards (below);
-  2. ledger record `intent` (see `ledger.ts`), with a fresh random **nonce**;
+  2. ledger record `intent` (see `ledger.ts`), with a fresh random **nonce**; cursor `c`
+     recorded;
   3. `execute` with `spec.idempotencyKey = opId` (never `mutationId`): prepare → apply →
-     `outbox.add` (fsync) → send; the `QueueStorage` wrapper records `queued` with the
-     prepared payload when the id first appears in a save;
-  4. wait for the dequeue of `opId` (timeout 30 s). Dequeue ⇒ ledger `acked` + result ⇒
-     **200**. Timeout ⇒ **202 `{status:"pending", mutationId}`**, caller polls
-     `GET /v1/mutations/{id}`. Nack ⇒ ledger `nacked`, **409**, writes blocked.
+     `outbox.add` → send. Inside `outbox.add`, the `QueueStorage` wrapper writes the
+     ledger op as `queued` **with the prepared payload** (`spec.payload` after prepare,
+     what the queue stores, `mutation-dispatch-service.ts:61-69`) **before** the outbox
+     temp → fsync → rename → fsync dir;
+  4. wait for the dequeue of `opId` (timeout 30 s). Dequeue ⇒ ledger `acked` + result +
+     `version` (from `onMutationAck`) ⇒ **200** (+ ordering check, rule 5). Timeout ⇒
+     **202 `{status:"pending", mutationId}`**, caller polls `GET /v1/mutations/{id}`;
+     writes stay 503 `pending` meanwhile. Nack: see Nack.
   The `acked` ledger write happens inside the `QueueStorage.save` that removes the id,
-  **before** that save resolves, so a crash can't leave "dequeued but not acked" on disk.
-- `ledger.ts` — `ledger.json`. Record per `Idempotency-Key`: `{key, bodyHash, nonce,
-  ops: [{opId, state: intent|queued|acked|nacked, payload?, result?}]}`. Op ids are
-  `'hdl_' + sha256(nonce + '#' + i)`: never derived from the key alone (a key reused after
-  the record expired would otherwise collide with an id the server already has, be acked
-  as a no-op, and the write would be lost silently, `mutations.go:124-138`,
+  **before** that save resolves. The rename order (ledger `queued` first, outbox second)
+  means a crash in between leaves `queued` without an outbox entry: **at startup, before
+  activation, every ledger op in `queued` state missing from `outbox.json` is put back**
+  (same id, same payload; the server dedups by id), so it drains in the first bootstrap.
+  "`queued` and not in the outbox ⇒ acked" is therefore valid only after that startup
+  step has run.
+- `ledger.ts` — `ledger.json`. Record per `Idempotency-Key`: `{key, bodyHash, nonce, c,
+  ops: [{opId, state: intent|queued|acked|nacked|failed, payload?, result?, version?}]}`.
+  Op ids are `'hdl_' + sha256(nonce + '#' + i)`: never derived from the key alone (a key
+  reused after the record expired would otherwise collide with an id the server already
+  has, be acked as a no-op, and the write would be lost silently, `mutations.go:124-138`,
   `sync-transport.ts:1044`). One request may issue several ops (a `PATCH` of n fields = n
   `updateColumn` ops). On a request:
   - no record ⇒ proceed;
   - record with a different `bodyHash` ⇒ **422**;
-  - all ops `acked` ⇒ 200 with stored results;
-  - an op `queued` (payload stored) ⇒ it is in the outbox or was dequeued without the
-    ledger write (impossible by the ordering above, but handled): if in the outbox, wait
-    for its dequeue; if not, treat as acked;
-  - an op `intent` only (crash before `outbox.add`) ⇒ it never reached the server:
-    execute again with the **same opId**; `prepare` runs again, which is correct because
-    the server has nothing under that id;
-  - a `nacked` op ⇒ 409.
+  - all ops `acked` ⇒ 200 with stored results (`result: null` for ops acked by a drain
+    after a crash, with `mutationId` and `payload` so the caller can re-read);
+  - an op `queued` ⇒ in the outbox by construction (startup re-insertion): wait for its
+    dequeue;
+  - an op `intent` only (crash before the ledger `queued` write, which precedes the
+    outbox write, so the server has nothing under that id) ⇒ execute again with the
+    **same opId**; `prepare` runs again, which is correct;
+  - a `nacked` (final) or `failed` op ⇒ 409 / 422 with the stored reason.
   `mutation_history` is never used as evidence of anything. Records are kept 30 days;
   a key that expired is a new key (new nonce, new ids), which is safe because the ids
   differ. Known gap, documented: continuous-rules follow-ups have their own random ids;
   a crash between the primary op's `outbox.add` and the follow-ups' `outbox.add`
   (`app-runtime.ts:243-253`) means a retry returns the stored result and the rules don't
   run.
-- Nack: `onMutationNacked` ⇒ ledger `nacked`, writes 503 `outbox_blocked`, reads `stale`,
-  `/v1/status.outbox_divergent = true`. Upstream keeps the entry queued and resends it
-  every 20 s (`getStale` + `resendSweep`), so it would be re-executed locally at every
-  start. Operator action: `POST /v1/admin/outbox/{id}/drop` (bearer with `admin` role in
-  `tokens`) removes it from `outbox.json`; the next restart rebuilds a clean DB.
-- `GET /v1/mutations/{id}` — `pending|acked|nacked|unknown` from the ledger + outbox.
+- Nack. Server codes (`client.go:18-29`): `storage_error` and `internal` are **transient**
+  ("re-send after a short delay"; upstream keeps the entry queued and the sweep resends
+  it, `sync-transport.ts:974-993`, `reconnection-service.ts:104`), only `invalid` is
+  final. Transient ⇒ ledger stays `queued`, `/v1/status.last_nack` set, the write path
+  keeps waiting (202 after the timeout). `invalid`, or the same id nacked 5 times ⇒ ledger
+  `nacked`, **409**, writes 503 `outbox_blocked`, reads `stale`, `outbox_divergent: true`.
+  An empty-id nack sets `last_nack` only. Operator action:
+  `POST /v1/admin/outbox/{id}/drop` (bearer with `admin` role in `tokens`) performs
+  `halt()`, waits for the file chains, removes the entry from `outbox.json`, writes
+  ledger `dropped`, and exits for a rebuild; dropping on a running queue is not possible
+  (the in-memory queue rewrites the file on the next ack, `offline-queue.ts:154-166`).
+- `GET /v1/mutations/{id}` — `pending|acked|nacked|failed|dropped|unknown`, with `version`
+  and `reordered` when acked.
 
 ### Read-only is structural
 
@@ -392,8 +450,18 @@ a listed name isn't in `KNOWN_OP_CODES` and prints registry ops not in any tier.
 
 **Per-op argument schema** in `op-policy.ts` (unknown keys rejected), with the real key
 names of each op at the pin:
+- the schema is a **closed accepted-key set per op**, written in `op-policy.ts` from the
+  op's `execute`/`prepare` at the pin (e.g. `transactions.add`: `budgetId`, `accountId`,
+  `categoryId`, `date`, `time`, `inflow`, `outflow`, `memo`, `payee`, `labelId`,
+  `cleared`, `splits[]` with `categoryId`, `transferAccountId`, `memo`, `payee`, `inflow`,
+  `outflow`, `receivedAmount`, `transactions.ts:586-667`; `saveSplits`: `transactionId`,
+  `splits[]` closed to `category_id`, `transfer_account_id`, `memo`, `payee`, `inflow`,
+  `outflow`, `amount`, `exactAmount` rejected); a test asserts every key the op reads is
+  either accepted or explicitly rejected;
 - always rejected: `mutationId`, `meta`, `idempotencyKey`, `opClock` (a caller clock
-  backdates the op on every device, `op-code-registry.ts:222, 247-250`);
+  backdates the op on every device, `op-code-registry.ts:222, 247-250`),
+  `exchangeRateOverride`, `fromPush` (relaxes mirror checks), `mirror`/`Mirror` on any
+  split line;
 - create ops: caller `id` rejected (`transactions.add`, `categories.create`,
   `categoryGroups.create`, `accounts.create`, `recurring.create`'s `input.id`,
   `addTransfer`'s `source.id`/`destination.id`); `transactions.add` rejects a non-empty
@@ -403,12 +471,12 @@ names of each op at the pin:
   by the headless, stored in the idempotency record so a retry reuses it;
 - **every** id reference validated against `budgetId`, target ids included: `id`/`ids`
   of `updateColumn`, `delete`, `setCleared` (`ids[]`, `transactions.ts:1592`),
-  `saveSplits`, `categories.updateName`, `categoryGroups.update`, `accounts.update`/
+  `saveSplits`' `transactionId` (`transactions.ts:1327-1342`), `categories.updateName`, `categoryGroups.update`, `accounts.update`/
   `setArchived`, `recurring.update`; `categories.create`'s `parentId`
   (`domains/categories.ts:222`); `moveToNewGroup`'s `categoryId`; recurring `toAccountId`
   and `splits[].categoryId/transferAccountId` (`recurring/types.ts:33-41, 84-115`);
-  `accountId`, `categoryId`, `transactions.add`'s `splits[].categoryId`/`splits[].transferAccountId`
-  (camelCase, `transactions.ts:620-667`), `saveSplits` lines (`category_id`,
+  `accountId`, `categoryId`, `labelId`, `transactions.add`'s
+  `splits[].categoryId`/`splits[].transferAccountId` (camelCase, `transactions.ts:620-667`), `saveSplits` lines (`category_id`,
   `transfer_account_id`, snake_case, `shared.ts:125-146`; `mirror`/`Mirror`/`pair_id`/
   `PairID` rejected; PascalCase `CategoryID`/`TransferAccountID` also accepted by core,
   `shared.ts:129-141`, so the line schema is closed), `addTransfer`'s `source.accountId`/`destination.accountId`,
@@ -422,7 +490,9 @@ names of each op at the pin:
 - `accounts.update`: core keeps current values for empty `name`/`type`/`currency` and
   leaves `metadata`/`onBudget` alone when undefined, preserving system keys
   (`core/.../accounts/index.ts:447-449, 484-498`, `queries.ts:150-158`). The guard accepts
-  **`name` only**; `type` and `currency` are sent from the current row; `metadata`,
+  **`name` only**; `type` and `currency` are sent as `''` (core keeps the current value for
+  an empty string, and copying the local value would revert a concurrent change on a peer
+  and convert with per-device rates, `:418`); `metadata`,
   `onBudget`, `linked_category_id`, `cc_payment_category_id`, `debt_total`,
   `paid_so_far`, `currencyRates` (`accounts.ts:152`) are rejected;
 - `payees.add`: `{budgetId, name}` (`domains/payees.ts:43`), `budgetId` forced.
@@ -472,8 +542,11 @@ milliunits.
   category ⇒ its available must be > 0 and the amount is clamped to it; one
   `batchUpsertAssignments` with two entries (`from` and `to` absolute totals read from the
   month rows), one entry when either side is `rta` (from `rta` = plain assignment to
-  `to`, as the app does); each entry's `budgetId` forced, ids validated; same
-  over-assign/overspend checks as above. Allowed tier; the generic op stays destructive.
+  `to`, as the app does); each entry's `budgetId` forced, ids validated; overspend check on
+  the source; over-assign check only when `from` is `rta` (the app runs none for
+  category→category, `useCategoryOperations.ts:405-447`). Allowed tier; the generic op
+  stays destructive. The generic `POST /v1/ops/monthlyBudgets.upsertAssignment` applies
+  the same checks as the `PUT` route.
 
 ## Decisions settled during review (Claude's calls, correctable)
 
@@ -508,22 +581,30 @@ milliunits.
      `createDatabase`, between activation and catch-up settled, on WS message received
      before apply. Headless as a child process, `SIGKILL` at point k for every k, then
      100 random kills. Oracle after each restart: status reaches `live`, and the headless
-     DB equals the peer's on **comparable tables**: every table except
-     `mutation_history` (compared as a set of `MutationID`s) and except columns stamped
-     with `datetime('now')` at apply time (`recurring.UpdatedAt/ReadyAt/NotifiedAt`,
-     `currency_rates.CreatedAt`, transaction label `UpdatedAt`; the exact list is produced
-     by a grep for `datetime('now')` in core at the pin and kept in the test);
+     DB equals the peer's under the upstream comparator `dumpDb(adapter, {sequences:
+     true, crossDevice: true})` (`fuzz/harness.ts:104-225`: it already excludes
+     `schema_migrations`, `sqlite_stat1`, `currency_rates`, `CreatedAt`/`UpdatedAt`/
+     `applied_at`, device-local occurrence ids, `LastOccurrenceDate`, rule-run stamps,
+     zero assignments, local sequences); `mutation_history` compared as a set of
+     `MutationID`s;
    - fault injection for the bootstrap invariant: blob download forced to fail ⇒ halt
-     (not an empty `live` DB); a quarantine-triggering remote mutation (test hook on
-     `onRemoteApplyFailed`'s input: a crafted encrypted mutation with an op the registry
-     rejects) ⇒ halt before any cursor move.
+     (not an empty `live` DB); a remote mutation whose apply throws (the bench encrypts
+     with `MutationEncryption` and sends a raw `mutation` frame with a **known** op that
+     fails in apply, e.g. `transactions.updateColumn` with `columnName: 'cleared'`,
+     delivered while the headless is down so it arrives through catch-up; an unknown op
+     would go to `haltForUpdate` instead, `sync-transport.ts:1219-1225`) ⇒ halt before any
+     cursor move. The poison stays in that space's log forever: throwaway space only.
    Done when: a peer write appears in `GET /v1/transactions` within 5 s; a restart
    rebuilds from the server and reaches `live`; month numbers equal the peer's core
    figures for 3 months; every crash point and the random kills pass the oracle; an
    out-of-band upload from the peer converges on the headless; the two fault injections
-   halt; header, WS URL and outbound-frame contract tests pass; **no HTTP call to
-   `POST /database/blob`** ever leaves the headless (recorded by a proxy in the bench
-   across the whole milestone run).
+   halt; header, WS URL and outbound-frame contract tests pass; every HTTP call the
+   headless makes is in an **allowlist** (login, spaces, `GET /database/blob`,
+   `GET /database/state`, `GET /version/latest`, `GET /exchange-rates`, WS upgrade),
+   recorded by a reverse proxy the bench puts at `url` (Node `fetch` and `ws` ignore
+   `HTTP_PROXY`; the FX path is relative and must go through the same base URL) across
+   the whole milestone run. Blob upload, blob history restore (`routes.go:139`) and
+   `PUT …/encrypted-key(s)` (`:160-161`) are therefore proven never called.
 2. **Writes.** `writes.ts`, `ledger.ts`, op policy + argument schemas, write routes,
    money endpoints, drain-and-rebuild.
    Done when, on the bench: REST ops appear at the peer and the peer's next snapshot
@@ -534,14 +615,21 @@ milliunits.
    seeded sequence, `setClock`, FX stub; same op sequence (including a continuous rule) ⇒
    equal `{op, args}`, `v` computed with `mutationFormatVersion` on both sides (the
    harness emits a constant), equal comparable tables; **write-path crash harness**: kill
-   at each of: after ledger `intent`, after `outbox.add` before send, after send before
-   ack, inside the dequeuing save; then retry with the same key ⇒ the server log holds
-   **exactly one** mutation per op id (checked via `GET /sync/mutations`) and the peer has
-   one row; same `Idempotency-Key` twice concurrently ⇒ one mutation; a restart with a
+   at each of: after ledger `intent`, after ledger `queued` before the outbox rename,
+   after `outbox.add` before send, after send before ack, inside the dequeuing save;
+   then retry with the same key ⇒ the server log grew by **exactly** the expected number
+   of entries since the pre-test version (primary ops + rule follow-ups; `GET
+   /sync/mutations?space_id&before&limit≤100`, newest first, `sync_service.go:31-42`,
+   `handler/sync.go:485-535`) and their decrypted `{op, args}` equal the ledger payloads;
+   the peer has one row; a write ordered behind a concurrent peer write (bench races the
+   peer) returns `reordered: true` and triggers a rebuild, after which comparable tables
+   equal the peer's; a throwing op (e.g. `addTransfer` with equal accounts) returns 422
+   and triggers a rebuild; same `Idempotency-Key` twice concurrently ⇒ one mutation; a restart with a
    non-empty outbox performs drain-and-rebuild and reaches `live` with comparable tables
    equal to the peer's; a key change at the peer halts the headless with no further
-   sends; a nack blocks writes, is visible in `/v1/status`, and the admin drop + restart
-   clears it; every argument guard has a rejecting test (unknown key, foreign-budget id
+   sends; a transient nack (bench server returning `storage_error`) keeps the op pending
+   and it lands on retry with **one** log entry; an `invalid` nack blocks writes, is
+   visible in `/v1/status`, and the admin drop clears it after the rebuild; every argument guard has a rejecting test (unknown key, foreign-budget id
    on every id path, `opClock`, `transferId`, `importIdentities`, `accounts.update` with
    anything but `name`, `from == to`, over-assign without the flag).
 3. **Deploy.** NAS upgrade to v1.22.1 (blob + DB backup first). Headless image built from
@@ -577,8 +665,10 @@ milliunits.
 - Space corruption through the log: mitigated by the app's own pipeline (U6), payload
   parity, argument schemas, the throwaway space, read-only first in production. Snapshot
   corruption: impossible by construction (no upload path).
-- Restart cost: a full bootstrap each time, two when the outbox was non-empty; acceptable
-  (seconds, LAN). If the NAS reboots nightly, that is one bootstrap per day.
+- Restart cost: a full bootstrap each time, plus one rebuild after every reordered or
+  failed write and every live restore; seconds each on LAN. Ambrogio writes a few times a
+  day and Federico edits from the phone rarely at the same instant, so rebuilds should be
+  rare; `rebuilds_today` in status shows if that assumption is wrong.
 - Availability: a halt makes reads 503 until the operator restarts; Ambrogio must handle
   503 gracefully (milestone 4).
 - Upstream churn (weekly releases): pin to a tag; server and headless upgrade together;
@@ -588,7 +678,7 @@ milliunits.
 
 ## Left to the builder
 
-- esbuild alias set and sql.js wasm loading.
+- esbuild alias set; sql.js stays an external resolved from the image's `node_modules`.
 - Exact JSON layout of `outbox.json` / `ledger.json`, as long as the write discipline
   holds.
 - Read response field names (amounts stay milliunits).
