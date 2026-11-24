@@ -1,6 +1,7 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: **v28**, after twenty-seven adversarial review rounds (54 reviewers; every critical/important finding verified in code at the pin).
+Date: 24/11/2026. Status: **v29**, after twenty-eight adversarial review rounds (56 reviewers; round 27–28
+verdicts: mechanics clean, coherence "ready for a planner"; v29 applies their minors) every critical/important finding verified in code at the pin).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet).
 Pin: upstream tag **v1.22.1 = `e40723e`**. `file:line` references are at that pin, relative to
 `packages/` of the Budgero monorepo unless another repo is named.
@@ -265,7 +266,7 @@ reason}`, no bearer) only, except on 143 where it exits too.
 4. Ledger reconciliation: `queued` ops missing from `outbox.json` are appended (same entry);
    `dropped` ids present are removed; `acked` ids present are removed; `unknown` ops become
    `queued` if present, `failed` otherwise (and later ops of that record `skipped`).
-   `quarantine.json` keys (not `covered`, not `tainted`) are served to upstream through
+   `quarantine.json` keys (not `tainted`; `covered` is decided at step 10) are served to upstream through
    `skipMutationKeys()` (U3); `failures.json` (not `tainted`) seeds `catchUpApplyFailures`.
    **Tainted** = recorded while the outbox was non-empty (8.4); if the outbox is empty **after**
    this reconciliation, tainted entries are dropped.
@@ -296,8 +297,11 @@ reason}`, no bearer) only, except on 143 where it exits too.
     seeds the cursor at the server head, `space-activation-service.ts:291`,
     `runtime-context-factory.ts:271, 283-290`, so the whole log since that blob would be
     skipped at every rebuild; the web app survives it because it rarely restores, the
-    headless rebuilds constantly). Same check in `onRestoreCompleted()`. Exception: no header and `getDatabaseState().mutation_version === 0` ⇒ bound 0, nothing
-    skipped, continue. Remedy: one write from the web app uploads a bound snapshot, then
+    headless rebuilds constantly). Same check in `onRestoreCompleted()`. Exception: no header and the last `getDatabaseState` body `http.ts` recorded (upstream fetches
+    it before the download, `space-activation-service.ts:160`, and after a restore,
+    `runtime-context-factory.ts:274`) has `mutation_version === 0` ⇒ bound 0, nothing skipped,
+    continue; a body **missing** the field (`GetLatestVersion` failed, `sync.go:450-480`) is a
+    transport failure (exit 78 at activation, exit 77 on the restore path), not a halt. Remedy: one write from the web app uploads a bound snapshot, then
     restart the container. Until then
     every entry counts as uncovered: step 4 loads entries with `covered` forced to false and
     `skipMutationKeys()` reads live state.
@@ -355,13 +359,12 @@ the file chains, exit **143**.
    `applyDirty`; after `settledAfterRestore()` exit 77 iff `queuedAtRestore > 0`, else back to
    `episode.priorState`. `applyDirty` still set at the next `onopen` or at socket close ⇒
    exit 77. **Once any exit (75/76/77) is scheduled it is irrevocable**: no rule leaves `draining`, and
-   `settledAfterRestore` and the episode return are ignored. Precedence: `halt` > 75 > 76 > 77.
+   `settledAfterRestore` and the episode return are ignored. Precedence: `halt` > 75 > 76 > 77 (78 and 1 never coincide with a write or an episode).
    `halt()` clears the flag and always wins (a terminal halt is never turned into a 77). A failure recorded while
    `queuedAtRestore > 0` is `tainted` (8.4) and is judged again by the next clean start.
    Restores during `bootstrapping` or the startup drain follow the same row (exit 77 only when
    `queuedAtRestore > 0`). On return to the startup `draining`, drain-end is re-checked
-   (`getQueue().length === 0` ⇒ exit 75 at once). Drain-end (75) and `queuedAtRestore > 0` (77)
-   cannot coincide: the first needs an empty queue, the second a non-empty one.
+   (`getQueue().length === 0` ⇒ exit 75 at once). A drain-end 75 and a scheduled 77 are resolved by precedence (75 wins).
 5. **Live ordering check, per request.** Gate (8.1) read under the apply-phase lock:
    `base = max(cursor, highest version among own acks)` (the ack handler calls
    `onMutationAck` before `updateLocalVersion`, so the cursor can lag one own ack). The
@@ -501,7 +504,10 @@ running: `halt()` (stops the resend sweep, so nothing is on the wire), state
 (role `admin`) is accepted **only in `outbox_blocked` and only on a record with a `nacked`
 op** (409 otherwise: anywhere else a `queued` op may already be on the wire; in
 `outbox_blocked` the send window of 1 guarantees nothing behind the nacked op was sent); it
-is **request-scoped**: wait for the file chains → mark `dropped` every op of the same ledger record
+is **request-scoped**: take the **apply-phase lock** (an op of the same request may still be
+mid-apply and its `outbox.add` would rewrite the dropped id back into `outbox.json`,
+`offline-queue.ts:63-69`), re-read the record, make the queue-storage wrapper **reject every
+`save`** until exit, wait for the file chains → mark `dropped` every op of the same ledger record
 still in `outbox.json` in one ledger write → remove them from `outbox.json` (the wrapper
 records this disappearance as a drop, not an ack) → exit 75. After a drop the key answers
 **409**.
@@ -514,9 +520,11 @@ version?}]}`,
 `state ∈ intent|queued|acked|nacked|failed|skipped|dropped|unknown`. `opId = 'hdl_' +
 sha256(nonce + '#' + i)` (never from the key alone: a reused key after expiry would collide
 with an id the server already has and be acked as a no-op). `bodyHash` = sha256 of method +
-path + canonical JSON of the parsed body (sorted keys, no whitespace). Retention 30 days.
+path + canonical JSON of the parsed body (sorted keys, no whitespace). Retention 30 days, **only** for records whose ops are all terminal
+(`acked|failed|skipped|dropped`) and none of whose ids is in `outbox.json`.
 
-Rules (a request's ops are all its own):
+Rules (a request's ops are all its own; evaluated **in this order**: `dropped` → `unknown` →
+`nacked` → mixed/acked):
 - no record ⇒ proceed; different `bodyHash` ⇒ **422** `key_reuse`;
 - all `acked` ⇒ 200 with stored results and the stored `reordered`/`partial` flags
   (`result: null` + `entry` for ops acked by a drain; `result: null, requery: true` for
@@ -525,7 +533,8 @@ Rules (a request's ops are all its own):
   re-executed with the same opId through the gate (the ledger `queued` write precedes the
   outbox write and the U2 `persisting` set keeps non-durable entries unsent, so the server
   has nothing under that id; `prepare` runs again, which is correct; the record's `base` is
-  refreshed) — but **never when an earlier op of the record is `failed`**; `failed`/`skipped`
+  refreshed) — but **never when any op of the record is not `acked`** (`failed`, `skipped`, `dropped`,
+  `nacked`, `unknown`); `failed`/`skipped`
   ops stay so ⇒ 200 `partial`; op 1 `failed` ⇒ 422;
 - any `unknown` ⇒ 202 `unknown` until startup resolves it;
 - any `nacked` ⇒ 202 `blocked` (from the record);
@@ -569,8 +578,8 @@ or `queuedAtRestore > 0`), our own ops run locally before peer mutations the ser
 earlier, so a peer mutation can fail **here only** (e.g. a peer `updateColumn` on a row our
 queued delete already removed, `core/.../transactions/index.ts:958-962`) and be quarantined
 in-process (the ack that would end the drain sits behind the restore in the receive chain,
-`sync-transport.ts:455-463, 475-497`). Failures and quarantines recorded in that condition are marked
-`tainted: true`, never served to `skipMutationKeys()`, never block writes beyond the drain,
+`sync-transport.ts:455-463, 475-497`). Failures and quarantines recorded while the outbox is non-empty (the 7.5.4 definition) are
+marked `tainted: true`, never served to `skipMutationKeys()`, never block writes beyond the drain,
 and are **dropped at step 4 of the next start whose outbox is empty**: the clean bootstrap
 judges the mutation again (a genuine failure fails twice and is quarantined untainted).
 
@@ -730,9 +739,10 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
    a forced in-process restore ⇒ no new entry, mutation skipped; a peer snapshot bound past
    it ⇒ `covered` on the next start, an older history restore ⇒ uncovered again; `retry` ⇒
    exit 77, replay, re-quarantine; a quarantine caused by a **corrupted `encryptedPayload`**
-   is skipped before decode at the next start; (moved to milestone 2: tainted case); 51 forced in-process
+   is skipped before decode at the next start; a blob served without `X-Mutation-Version` on an **empty** log ⇒ `live` with cursor 0; 51 forced in-process
    restores ⇒ halt `restore_loop`; unknown op code ⇒ halt `unknown_op`; header,
-   WS URL and frame tests; state never leaves `draining` between `onQuarantined` and the exit;
+   WS URL and frame tests; a 2-op request whose op 1 is nacked `invalid` while op 2's apply is
+   blocked, then admin drop ⇒ `outbox.json` empty and every op `dropped`; state never leaves `draining` between `onQuarantined` and the exit;
    a catch-up-unsafe restore served an unbound blob ⇒ halt before the cursor is reseeded; proxy saw **only** allowlisted calls (login, `GET /profile`, `GET
    /budget-spaces`, `HEAD /health`, `GET /database/blob`, `GET /database/state`, `GET
    /version/latest`, WS upgrade; `GET /exchange-rates` allowed but not required, a peer
