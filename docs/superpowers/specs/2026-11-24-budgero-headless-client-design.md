@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: draft v10, after review rounds 1–9 (eighteen adversarial reviewers;
+Date: 24/11/2026. Status: draft v11, after review rounds 1–10 (twenty adversarial reviewers;
 every critical/important finding verified in code and folded in below).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet; we start anyway).
 Code references and the pin: upstream tag **v1.22.1 = `e40723e`** (also master HEAD on 24/11).
@@ -180,8 +180,10 @@ post-restore migrations and catch-up correctly); we keep it and add injection po
   `reconnection-service.ts:336-352`) and `replayQueueViaSync` (`:244-280`) can send an
   entry that is not yet durable, contradicting the "queued durably BEFORE any send"
   comment at `mutation-dispatch-service.ts:71-74`. U2 adds a `persisting` set to
-  `OfflineQueue`: ids are added before the save and removed when it resolves;
-  `getStale()` and the replay skip them. Without it, "`intent` ⇒ the server has nothing"
+  `OfflineQueue`: ids are added before the save and removed only when it **resolves** (a
+  rejected save leaves the id in the set); a new `getSendable()` used by `getStale()`,
+  `getUnsent()` and the replay skips them, while `getQueue()` stays unfiltered (reapply
+  and `queuedCount` must see every entry). Without it, "`intent` ⇒ the server has nothing"
   (ledger rules) would be false.
 - **U3 — hooks.**
   - `allowUpload?: () => boolean`, ANDed with the existing `DatabaseSyncDeps.canUploadSnapshot`
@@ -230,7 +232,8 @@ post-restore migrations and catch-up correctly); we keep it and add injection po
 
 ### Durability (cache-only model)
 
-What survives a restart: `outbox.json`, `ledger.json`, config. Nothing else.
+What survives a restart: `outbox.json`, `ledger.json`, `rebuilds.log`, `reason` (last exit
+reason, served by the supervisor), config. Nothing else.
 
 - **DB in memory** (`NodeSqlJsAdapter`, no `forceSave`), discarded on exit.
 - **`storage.ts`** — in-memory `localStorage` shim, reset at every start (client session
@@ -240,7 +243,9 @@ What survives a restart: `outbox.json`, `ledger.json`, config. Nothing else.
   `mutation-dispatch-service.ts:76`). **One promise chain per file**, content snapshotted
   at call time, unique temp names (the web adapter serialises for the same reason,
   `web-adapter.ts:555-566`). The wrapper also notices ids that *disappear* from the queue
-  between saves: that is the only place an entry leaves the queue
+  between saves: in the headless that is the only place an entry leaves the queue
+  (`clear()`/`setQueue()` exist, `offline-queue.ts:272-283`, reachable only from the app
+  UI; the wrapper halts if `QueueStorage.clear` is ever called),
   (`OfflineQueue.ackMutation`, `offline-queue.ts:154-166`), reached both by `mutation_ack`
   and by the implicit ack when our own mutation comes back via catch-up/broadcast
   (`runtime-lifecycle-service.ts:196-201`), and it is what the write path waits on.
@@ -260,7 +265,12 @@ included at their server position.**
 3. If the outbox was non-empty at start, the reapplied entries were applied **before**
    catch-up, i.e. out of server order (`:363-377`). So: status `draining`, wait until the
    outbox drains (every entry acked, or finally nacked: see Nack), then **rebuild**.
-4. `onDatabaseRestored(queuedCount > 0)` after a live restore ⇒ `draining`, then rebuild.
+4. **Every** live restore while `live` ⇒ `draining`, then rebuild, whatever `queuedCount`
+   is: `downloadAndRestore` does not wait for a running write (`database-sync.ts:423-449`,
+   `beginOperation` only holds uploads, `:141-158`), so an op mid-apply at restore time is
+   neither in the queue for reapply nor re-applied by catch-up (its echo is an implicit
+   ack, `runtime-lifecycle-service.ts:196-201`), and an out-of-band blob is not in the log,
+   so the ordering check can't see it. Restores are rare (peer import or DB restore).
 5. **Live ordering check, per request, in the dequeue observer.** A request issues `k ≥ 1`
    ops: its own (one per `/v1/ops`, n for a `PATCH`) plus the continuous-rules follow-ups
    the U6 pipeline issues with random ids right after the primary is sent
@@ -300,7 +310,12 @@ included at their server position.**
    - in a **continuous-rules follow-up** (`onFollowUpError`, prepare or apply): the
      primary is already queued and sent (`app-runtime.ts:244-253`), so the request is
      **not** failed: wait for the primary's dequeue, answer **200** (or 202) with
-     `rules_failed: true`, ledger primary `acked`, follow-up `failed`; then rebuild.
+     `rules_failed: true`, ledger primary `acked`, follow-up `failed`; then rebuild (exit
+     76: a user-configured rule that throws on every add must not count as a storm). If
+     the follow-up's error came from its own `outbox.add`, mark it `unknown` (the entry
+     may still be written by a later save and drain). The hook also covers the `listRules`
+     catch and the `!services` return (`app-runtime.ts:851, 857`), outside the range
+     `:875-903`.
      A 422 here would make a caller re-create the transaction under a new key: doubled
      on every device;
    - from `outbox.add` itself (the entry is already in the in-memory queue but, with the
@@ -415,8 +430,8 @@ time, which is Budgero's own semantics and identical in the web app.
   intent|queued|acked|nacked|failed|dropped, entry?: serialized MutationPayload,
   result?, version?}]}` (`entry` is the full queue
   entry as the wrapper sees it in `save()` — `id`, `op`, `args`, `v`, `timestamp`,
-  `interfaces.ts:77-86`, `storage.ts:40-54` — not just the args, so startup put-back can
-  rebuild it).
+  `baseVersion`, `spaceId`, `interfaces.ts:77-86`, `storage.ts:40-54` — the whole object,
+  so startup put-back can rebuild it).
   Op ids are `'hdl_' + sha256(nonce + '#' + i)`: never derived from the key alone (a key
   reused after the record expired would otherwise collide with an id the server already
   has, be acked as a no-op, and the write would be lost silently, `mutations.go:124-138`,
@@ -424,15 +439,23 @@ time, which is Budgero's own semantics and identical in the web app.
   `updateColumn` ops). On a request:
   - no record ⇒ proceed;
   - record with a different `bodyHash` ⇒ **422**;
-  - all ops `acked` ⇒ 200 with stored results (`result: null` for ops acked by a drain
-    after a crash, with `mutationId` and `payload` so the caller can re-read);
+  **Retry decisions look at own ops only (`own: true`); follow-up states never decide
+  the status code, they only set `rules_failed`/`rules_dropped` on the stored 200.**
+  - all own ops `acked` ⇒ 200 with stored results (`result: null` for ops acked by a drain
+    after a crash, with `mutationId` and `payload` so the caller can re-read); for a
+    multi-op request where op k failed after ops 1..k-1 landed, 200 with per-op results
+    and `partial: true` (`updateColumn` is idempotent, nothing doubles);
   - an op `queued` ⇒ in the outbox by construction (startup re-insertion): wait for its
     dequeue;
   - an op `intent` only (crash before the ledger `queued` write, which precedes the
     outbox write, so the server has nothing under that id) ⇒ execute again with the
     **same opId**; `prepare` runs again, which is correct;
-  - a `failed` op ⇒ 422 with the stored reason; a `nacked` op ⇒ 202 `blocked` while it is
-    still in the outbox, **409 only once `dropped`** (see Nack); a `dropped` op ⇒ 409.
+  - first own op `failed` ⇒ 422 with the stored reason; an own op `nacked` ⇒ 202 `blocked`
+    while it is still in the outbox (this branch answers from the record, before the
+    gate), **409 only once `dropped`** (see Nack); an own op `dropped` ⇒ 409.
+  `GET /v1/mutations/{id}` maps ledger `intent` → `pending`, `queued` → `pending`, the rest
+  1:1; it and `/v1/status` are served in every state, including `halted` and
+  `outbox_blocked`, so a caller holding a 202 can always learn the outcome.
   `mutation_history` is never used as evidence of anything. Records are kept 30 days;
   a key that expired is a new key (new nonce, new ids), which is safe because the ids
   differ. Known gap, documented: continuous-rules follow-ups have their own random ids;
@@ -449,10 +472,11 @@ time, which is Budgero's own semantics and identical in the web app.
   applied out of order: same state as a half-applied halt), `outbox_divergent: true`; the entry keeps
   being resent and nacked, and would be reapplied at every start, so **at startup, if the
   ledger says `nacked` for an entry still in `outbox.json`, the process stays up as
-  `outbox_blocked` and does not drain or rebuild**. A nack on a follow-up id blocks the
-  request it belongs to the same way. An empty-id nack (`client.go:149`) sets `last_nack`
-  only. Operator action: `POST /v1/admin/outbox/{id}/drop` (bearer listed in `tokens` as
-  `admin:<token>`; the token file format becomes `name:role:token`) performs `halt()`,
+  `outbox_blocked` and does not drain or rebuild** (no activation at all: the entry would
+  be reapplied and resent; the coordinator is not built, the admin drop works on the file
+  directly). A nack on a follow-up id blocks writes the same way but never changes the
+  request's status code (the primary landed). An empty-id nack (`client.go:149`) sets `last_nack`
+  only. Operator action: `POST /v1/admin/outbox/{id}/drop` (role `admin`, see Config) performs `halt()` if a coordinator exists,
   waits for the file chains, removes the entry from `outbox.json`, writes ledger
   `dropped`, exits 75 for a rebuild; the caller's next retry gets **409**. Dropping on a
   running queue is not possible (the in-memory queue rewrites the file on the next ack,
@@ -482,7 +506,8 @@ return 503** (the in-memory DB may be half-applied or stale, and there is no "la
 file" to fall back to). Restart only by operator action: a container restart rebuilds
 from the server. Never auto-reload, never re-key.
 
-Reads report `stale: true` until the initial catch-up has settled. Reads are not
+Reads: 200 + `stale: true` in `bootstrapping`; **503 `draining`** in `draining` (the DB
+is out of server order by definition) and 503 in `outbox_blocked`/`halted`. Reads are not
 serialised with remote applies: a read can observe an op mid-apply; acceptable for
 Ambrogio, stated in the API docs.
 
@@ -579,15 +604,97 @@ policy test re-checks them on every upgrade.
 
 `config.json` (non-secret): `url` (`http://budgero.cloud.lazycat.app.budgero.lzcapp:3001`),
 `user`, `spaceId`, `budgetId`, `readOnly`, `allowDestructive`, `port` (8787).
-Secret files, mode 600: `password`, `space.key` (raw base64, from Settings → Push API →
-export), `tokens` (one bearer per consumer, one per line, `name:role:token`, role
-`write|read|admin`).
+Secret files, mode 600, owned by uid 1001: `password`, `space.key` (raw base64, from
+Settings → Push API → export), `tokens` (one bearer per consumer, one per line,
+`name:role:token`; roles and the route matrix in Startup step 2).
 With no `config.json` the service idles, `/v1/status` says `not_configured`, and it never
 contacts the server. `TZ=Europe/Rome` and `BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}`
 come from the manifest (the same value the server's `WEBSOCKET_ALLOWED_ORIGINS` uses).
 These two are the **only** environment inputs in production; the bench passes
 `--config-dir <path>` and `--bench` on the command line. `local.env` is not used (build-time
 substitution, not runtime config).
+
+### Startup and shutdown (ordered)
+
+1. Parse `--config-dir` (default `/lzcapp/var/headless`), `--bench`, `--crash-at`. Read and
+   validate `config.json` and the secret files; any error ⇒ write `reason` file
+   (`config:<field>`), exit **1** (supervisor stays down and serves the reason).
+2. Load `tokens` (`name:role:token`, roles `read|write|admin`; a malformed line is a config
+   error). Role matrix: `read` → GET routes; `write` → `read` + write routes; `admin` →
+   `write` + `/v1/admin/*`. A role mismatch is **403 `role`** (distinct from 403 `policy`).
+   `/v1/status` needs any valid bearer when served by the worker; the supervisor's copy
+   needs none and carries no secrets.
+3. Read `rebuilds.log` (for `rebuilds_24h` and the 429 window).
+4. Ledger put-back: every `queued` op missing from `outbox.json` is appended to it.
+5. Read-only check: `readOnly` and non-empty outbox ⇒ `reason=outbox_in_readonly`, exit 1.
+6. Nacked check: a ledger `nacked` op still in `outbox.json` ⇒ state `outbox_blocked`,
+   serve `/v1/status`, `/v1/mutations/*`, `/v1/admin/*` only; **no activation**.
+7. Version check (`GET /version/latest`, unauthenticated, `routes.go:30`) ⇒ mismatch or
+   `unknown` ⇒ halt `version_mismatch`.
+8. Login.
+9. Activate (bootstrap invariant). `bootstrapping` → `live`, or `draining` when the outbox
+   was non-empty.
+
+Shutdown on `TERM`/`INT` (forwarded by the supervisor): stop accepting requests (503
+`shutting_down`), `coordinator.halt()`, wait for both file chains, exit **143**.
+
+### Rebuild and exit codes
+
+| Trigger | Exit | Counted for storm (20/24 h) | Counted for 429 (5/10 min) |
+|---|---|---|---|
+| `reordered` (ordering check) | 75 | yes | no |
+| live restore while `live` | 75 | yes | no |
+| drain finished after non-empty outbox | 75 | yes | no |
+| admin drop | 75 | yes | no |
+| primary apply throw (422) | 76 | no | yes |
+| follow-up failure (`rules_failed`) | 76 | no | yes |
+| config error, `outbox_in_readonly`, uncaught exception | 1 | stays down | — |
+| `TERM`/`INT` | 143 | stays down | — |
+
+The worker appends `{ts, code, reason}` to `rebuilds.log` before exiting and writes the
+last `reason` to the `reason` file; the supervisor relaunches on 75/76 only.
+
+### `/v1/status` schema
+
+```json
+{"state":"not_configured|bootstrapping|draining|live|outbox_blocked|halted|shutting_down",
+ "reason": "version_mismatch|format_too_new|unknown_op|remote_apply_failed|key_changed|rebuild_storm|outbox_in_readonly|config:<field>|null",
+ "stale": true, "cursor": 12345, "outbox_size": 0, "outbox_divergent": false,
+ "last_nack": {"id":"hdl_…","code":"storage_error","at":"2026-11-24T10:00:00Z"},
+ "rebuilds_24h": 1, "versions": {"server":"1.22.1","bundled":"1.22.1"}}
+```
+Write responses: 200 `{results:[…], mutationIds:[…], reordered?, rules_failed?, partial?}`;
+202 `{status:"pending|blocked|unknown", mutationIds}`; errors `{error, reason}`.
+
+### Image and manifest
+
+- Build stage (fork): `pnpm install --frozen-lockfile` with `packages/headless` added to the
+  workspace and to the lockfile (`ws`, `esbuild`), then `esbuild` → `dist/headless.mjs`
+  with `sql.js` left **external**.
+- Runtime stage: `node:22-alpine` + `busybox-extras` (supervisor's HTTP responder) +
+  `dist/` + `node_modules/sql.js/dist` copied to **`/app/node_modules/sql.js/dist`**, and
+  the worker runs with `cwd=/app` (`NodeSqlJsAdapter` loads from
+  `process.cwd()/node_modules/sql.js/dist`, `node-sqljs-adapter.ts:45-47`; under pnpm
+  `sql.js` is a dependency of `core` only, `core/package.json:62`, not hoisted, so it is
+  copied explicitly). Runs as uid 1001; the manifest's `setup_script` chowns
+  `/lzcapp/var/headless` to 1001 so mode-600 secrets are readable (Lazycat runs
+  containers as root unless told otherwise).
+- Manifest service:
+  ```yaml
+  headless:
+    image: registry.lazycat.cloud/<mirror>/fliva/budgero-headless:1.22.1
+    user: "1001:1001"
+    binds:
+      - /lzcapp/var/headless:/lzcapp/var/headless
+    environment:
+      - TZ=Europe/Rome
+      - BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}
+    health_check:
+      test: [CMD, wget, -qO-, http://localhost:8787/v1/status]
+  ```
+  The Dockerfile lives in `lzc-budgero/docker/headless/` and builds from the fork at the
+  pinned tag (a `git clone --branch` of `f-liva/budgero`), separate from the server
+  image, which stays the upstream release image.
 
 ### REST API (v1)
 
@@ -605,7 +712,7 @@ milliunits.
   `OP_CODE_FORMAT_VERSIONS`).
 - `POST /v1/ops/{op}` — one op; guarded args → execute → ack → `{result, mutationId}`;
   `Idempotency-Key` required. 200 (`reordered`/`rules_failed` flags) / 202 pending|blocked
-  / 403 policy / 409 dropped / 422 schema|failed|key reuse / 429 / 503.
+  |unknown / 403 policy|role / 409 dropped / 422 schema|failed|key reuse / 429 / 503.
 - `GET /v1/mutations/{id}` — ledger state of a mutation.
 - Convenience wrappers (each documents how many ops it issues): `POST /v1/transactions`
   (1), `PATCH /v1/transactions/{id}` (one `updateColumn` per field; `cleared` →
@@ -656,9 +763,13 @@ milliunits.
      raw key and budget id for the headless. The headless itself never creates keys;
    - `bench/peer.ts`: a second client (stock coordinator + same platform pieces, **with**
      uploads, standing in for the web app) writing through the real server;
-   - crash harness (read-only points only): kill during snapshot download, during
-     `createDatabase`, between activation and catch-up settled, on WS message received
-     before apply. Headless as a child process, `SIGKILL` at point k for every k, then
+   - crash harness (read-only points only): the worker accepts `--crash-at=<point>` (only
+     with `--bench`) and calls `process.kill(process.pid, 'SIGKILL')` at that named point;
+     the point list is an exported enum (`crash-points.ts`) the harness iterates:
+     `snapshot_download`, `create_database`, `before_catchup_settled`, `ws_before_apply`,
+     and in milestone 2 `after_ledger_intent`, `after_ledger_queued_before_rename`,
+     `after_outbox_add_before_send`, `after_send_before_ack`, `in_dequeuing_save`.
+     Headless as a child process, `SIGKILL` at point k for every k, then
      100 random kills. Oracle after each restart: status reaches `live`, and the headless
      DB equals the peer's under the upstream comparator `dumpDb(adapter, {sequences:
      true, crossDevice: true})`. `dumpDb` lives in the app's vitest harness
@@ -687,8 +798,10 @@ milliunits.
    halt; header, WS URL and outbound-frame contract tests pass; every HTTP call the
    headless makes is in an **allowlist** (login, `GET /profile`, `GET /budget-spaces`,
    `HEAD /health`, `GET /database/blob`, `GET /database/state`, `GET /version/latest`,
-   `GET /exchange-rates`, WS upgrade; the list is asserted both ways: every call seen is
-   listed, every listed call is seen at least once),
+   WS upgrade; the list is asserted both ways: every call seen is listed, every listed
+   call is seen at least once; `GET /exchange-rates` is reached only from prepare/currency
+   ops, `core/.../currency/index.ts:380-390`, so it joins the allowlist in milestone 2
+   with a multi-currency write),
    recorded by a reverse proxy the bench puts at `url` (Node `fetch` and `ws` ignore
    `HTTP_PROXY`; the FX path is relative and must go through the same base URL) across
    the whole milestone run. Blob upload, blob history restore (`routes.go:139`) and
