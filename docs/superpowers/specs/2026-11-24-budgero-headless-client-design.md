@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: **v25**, after twenty-four adversarial review rounds (48 reviewers; every critical/important finding verified in code at the pin).
+Date: 24/11/2026. Status: **v26**, after twenty-five adversarial review rounds (50 reviewers; every critical/important finding verified in code at the pin).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet).
 Pin: upstream tag **v1.22.1 = `e40723e`**. `file:line` references are at that pin, relative to
 `packages/` of the Budgero monorepo unless another repo is named.
@@ -153,6 +153,7 @@ migrations and catch-up correctly. Running continuous rules was rejected in v15 
   | `skipMutationKeys(): ReadonlySet<string>` | in **both transport loops before `decodeMutationPayload`** (`sync-transport.ts:1080-1089` live, `:1210-1212` catch-up; a decode/normalise failure throws before `onRemoteMutation` is reached, `:1117-1137`), keyed `catchUpFailureKey(m)` (`:1393-1395`; on the **live** path the frame carries `msg.mutationId`, not `msg.id`, `types/messages.ts:8, 22`, so the key is built from `{id: msg.mutationId, version: msg.version}` and the same normalised pair is passed to every hook); a hit skips and advances the cursor as quarantine does (`:1414`) | sync | keys from `quarantine.json` not `covered` and not `tainted` (8.4); never touched by `resetForRestore` |
   | `onRemoteApplySucceeded(key)` | catch-up success next to the in-memory delete (`sync-transport.ts:1215`) and the live success path | sync | remove the key from `failures.json` |
   | `seedCatchUpFailures(): Map` | transport construction, into `catchUpApplyFailures` (`:194`) | sync | entries of `failures.json`, so a mutation that failed once before an exit is quarantined on its next failure instead of restored again. Live failure rule (one sentence): if the map holds the same `{version, precedingVersion}` ⇒ quarantine, else record and restore |
+  | `onRestoreCompleted()` | after `onCatchUpUnsafe` returns normally (`runtime-context-factory.ts:251-296`) | sync | clears `applyDirty` |
   | `beforeRestore({reason})` | `downloadAndRestore` after `download()` returned non-null, before `db.restore()` (`database-sync.ts:427-433`); `reason` threaded from its callers: `onCatchUpUnsafe` (`runtime-context-factory.ts:251-259`), out-of-band `downloadLatest` (`runtime-coordinator.ts:640-650`) | yes | restore table (7.5.4) |
   | `settledAfterRestore(): Promise<void>` | resolved by the transport when the catch-up started on the connection opened after a restore has settled (`initialCatchUpSettled` is one-shot, `sync-transport.ts:1589-1591`, so a per-connection signal is added) | — | leaves `draining` |
   | `receiveIdle` in `getSyncDiagnostics()` | `receiveTail === null && catchUpMutationBuffer.length === 0`, `sync-transport.ts:179, 475, 488-497` | sync | gate condition |
@@ -325,10 +326,24 @@ the file chains, exit **143**.
    |---|---|---|---|
    | blob check on reconnect (7.2) | WS shim; upstream downloads nothing | no restore: `draining` → exit **77** when the lock is free; leftovers drain next start | `rebuilds.log` 77, budget 50/24 h → `restore_storm` |
    | out-of-band `sync_state_changed` frame | WS shim (`draining` at once) + `beforeRestore({reason:'out_of_band'})` | exit **77** when the lock is free | same |
-   | fallback restore whose `download()` **threw** (health check false, fetch error: `database-sync.ts:346-375`; `beforeRestore` never fires, upstream only logs and reconnects, `sync-transport.ts:1534-1567`) | `applyDirty` flag set by `onRemoteApplyFailed` (synchronously, with `draining`) and cleared by `beforeRestore`; still set when the socket closes | exit **77** after the apply-phase lock (the DB holds the failed apply's partial writes; `failures.json` already has the first failure) | `rebuilds.log` 77 |
+   | remote apply failure that upstream will **restore** (first failure) | `onRemoteApplyFailed` opens a **failure episode** (below) | in-process restore as the row above; if the restore never completes (download threw, `database-sync.ts:346-375`; `db.restore` threw; socket died first — upstream only logs and reconnects, `sync-transport.ts:1534-1567`) the episode is still open at the next `onopen` or socket close ⇒ exit **77** | `rebuilds.log` 77 |
    | catch-up-unsafe fallback (`apply_failed`, gap, bad page) | `beforeRestore({reason:'catchup_unsafe'})` | **completes in-process** (upstream quarantines a mutation only on its **second** failure at the same `precedingVersion`, `sync-transport.ts:194, 1231-1244`; exiting on the first would loop). `draining` until `settledAfterRestore()`; then **exit 77 iff `queuedAtRestore > 0`** (the reapplied outbox put the DB out of order), else back to `priorState` (`live`, `bootstrapping` or the startup `draining`): a restore with an empty queue is snapshot + log in server order whatever the state; a `beforeRestore` with no `reason` (other callers, `database-sync.ts:259`, `runtime-coordinator.ts:701`, unreachable here) follows the out-of-band row | `halts.log` `restore_inproc`; `/v1/status.restores_inproc_24h`; > 50 in 24 h (from `halts.log`, survives restarts) ⇒ halt `restore_loop`; recovery failure (`syncDisabled`, `SnapshotUnavailableError`, `:1538-1550`, observed through the sync-status listener as `syncError.code === 'snapshot_unavailable'`, `:642-650`) ⇒ halt `restore_failed` |
 
-   If the latch closes while `draining`, exit **75** wins. A failure recorded while
+   **Failure episode** (one rule set for `onRemoteApplyFailed`, both paths): persist the
+   failure (`tainted` if the outbox is non-empty). If the in-memory copy of `failures.json`
+   already holds the same `{version, precedingVersion}`, upstream will **quarantine** (no
+   restore): do nothing more here; `onQuarantined` then, for an **untainted** entry, exits
+   **77** after the apply-phase lock (the DB holds the failed apply's partial writes; the next
+   start skips the key before decode, so no loop; counted in the 77 budget) and, for a
+   tainted one, does nothing (the drain-end 75 rebuilds anyway). Otherwise upstream will
+   **restore**: open the episode `{priorState: the state at this first transition,
+   applyDirty: true}` and flip to `draining`; `beforeRestore` records `queuedAtRestore` and
+   keeps the episode; a **successful** restore (U3 `onRestoreCompleted()`, called where
+   `onCatchUpUnsafe` returns normally, `runtime-context-factory.ts:251-296`) clears
+   `applyDirty`; after `settledAfterRestore()` exit 77 iff `queuedAtRestore > 0`, else back to
+   `episode.priorState`. `applyDirty` still set at the next `onopen` or at socket close ⇒
+   exit 77. `halt()` clears the flag and always wins (a terminal halt is never turned into a
+   77). If the latch closes while `draining`, exit **75** wins. A failure recorded while
    `queuedAtRestore > 0` is `tainted` (8.4) and is judged again by the next clean start.
    Restores during `bootstrapping` or the startup drain follow the same row (exit 77 only when
    `queuedAtRestore > 0`). On return to the startup `draining`, drain-end is re-checked
@@ -465,7 +480,8 @@ that save resolves. `queued` precedes the outbox rename, so a crash between them
 timeout; upstream resends. `format_too_new` ⇒ halt `version_mismatch` (entry kept, ledger stays `queued`). `invalid`, `other` ⇒ ledger `nacked`, state
 `outbox_blocked`, `outbox_divergent: true`. **No nack is ever answered with 409 while the
 entry is on disk** (upstream resends forever and the op can still land). An empty-id `invalid` nack (unparseable frame, `client.go:149`) is pinned on the single
-outstanding `mutation` frame (send window of 1) and treated as a blocking nack; an empty-id
+outstanding `mutation` frame (send window of 1) and treated as a blocking nack; with no
+`mutation` frame outstanding it is `last_nack` only; an empty-id
 transient nack ⇒ `last_nack` only. Any **blocking** nack (`invalid`, `other`) while
 running: `halt()` (stops the resend sweep, so nothing is on the wire), state
 `outbox_blocked` in-process with `reason: nack_blocked`, routes per 7.3. Operator: `POST /v1/admin/outbox/{id}/drop`
@@ -510,23 +526,21 @@ record's `reordered`.
 `onQuarantined(mutation, error)` ⇒ upsert `{key, id, version, op, error: {name, message}, at,
 acked: false, covered: false}` in `quarantine.json` (idempotent per key: an existing entry
 keeps `acked` and resets `covered`), `halts.log` `quarantine`, `/v1/status.quarantined` (incl. `tainted`). **Writes answer 503
-`quarantine_pending` while any entry is neither acked nor covered** (reads stay 200; a retry
+`quarantine_pending` while any untainted entry is neither acked nor covered** (reads stay 200; a retry
 answered from the ledger record still answers). Keys follow `catchUpFailureKey`
 (`sync-transport.ts:1393-1395`): `id`, or `version:N` for an id-less mutation; the hook
 receives both id and version (U3 passes `m.version`), so either form is matched.
 
 A quarantine is **not forever**:
-- **covered**: recomputed at **every** start as `version ≤ bound`, where `bound` is the catch-up
-  cursor activation seeded from the restored snapshot (`setPersistedMutationCursor`,
-  `space-activation-service.ts:289-292`, read from the shim key `MUTATION_CURSOR_STORAGE_PREFIX +
-  spaceId` right after a `server_snapshot` activation, step 10; `lastDownloadedMutationVersion`
-  is undefined at that point because the bootstrap download bypasses `dbSync`). The shim falls
+- **covered**: recomputed at **every** start as `version ≤ bound`, where `bound` is `readSnapshotVersions(headers).mutationVersion`
+  of the blob response `http.ts` returned last before `downloadSnapshot` succeeded (hash
+  retries can produce several, `snapshot-download.ts:65-88`); upstream seeds the same value
+  into the cursor (`space-activation-service.ts:289-292`) but falls back to the server head
+  for a legacy blob, which is why the shim key is **not** used. The shim falls
   back to the server head for a legacy blob with no `mutation_version`
   (`space-activation-service.ts:289-292`), so `http.ts` records whether the blob response
   carried an **`X-Mutation-Version` header** (`snapshot-download.ts:41-47`, sent only when the
-  server has a bound, `handler/sync.go:126-128`; tested with `headers.has`, `0` is valid; `bound` is taken from `readSnapshotVersions(headers).mutationVersion` of the
-  **accepted** `downloadBlob` response, not from the shim key, which upstream deletes for 0,
-  `space-activation-service.ts:511-513`); if the header is absent, `bound` is undefined ⇒ never
+  server has a bound, `handler/sync.go:126-128`; `0` is valid; `readSnapshotVersions` decides presence, not `headers.has`); if the header is absent, `bound` is undefined ⇒ never
   covered (relevant at the NAS upgrade: the last blob may come from a pre-1.22 client). A covered entry leaves `skipMutationKeys()` and the gate: catch-up starts after
   `bound`, so the mutation is never replayed, and whatever the snapshot holds came from a peer.
   It can go back to false (a history restore may publish an older bound, `blob_history.go:360-363,
@@ -701,12 +715,11 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
    (`recentDownloadWindowMs` policy); remote
    mutation whose apply throws (`updateColumn` on a deleted row, injected while the headless
    is down and the peer stopped, throwaway space) ⇒ in-process restore, retry, quarantine,
-   `quarantined: [1 entry]` with `op`/`error`, no exit 77 in `rebuilds.log`; restart **and**
+   `quarantined: [1 entry]` with `op`/`error`, **one** exit 77, then `live` with the key skipped; restart **and**
    a forced in-process restore ⇒ no new entry, mutation skipped; a peer snapshot bound past
    it ⇒ `covered` on the next start, an older history restore ⇒ uncovered again; `retry` ⇒
    exit 77, replay, re-quarantine; a quarantine caused by a **corrupted `encryptedPayload`**
-   is skipped before decode at the next start; a peer edit of a row our queued delete removed, met during the startup drain ⇒ quarantined
-   **tainted** in-process, exit 77, dropped at the next clean start, applied normally there; 51 forced in-process
+   is skipped before decode at the next start; (moved to milestone 2: tainted case); 51 forced in-process
    restores ⇒ halt `restore_loop`; unknown op code ⇒ halt `unknown_op`; header,
    WS URL and frame tests; proxy saw **only** allowlisted calls (login, `GET /profile`, `GET
    /budget-spaces`, `HEAD /health`, `GET /database/blob`, `GET /database/state`, `GET
@@ -733,8 +746,10 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
    exit 77 on reconnect; quarantine with writes: 503 `quarantine_pending`, admin ack ⇒
    writes open; outbox non-empty at start + injected catch-up failure ⇒ exit 77, never `live` while the
    outbox is non-empty at start; `checkApiHealth` false during an `apply_failed` ⇒ exit 77
-   (`applyDirty`), then quarantine at the next start; a **live** peer failure (headless connected) ⇒ one
-   restore then quarantine; admin drop outside `outbox_blocked` ⇒ 409; injected
+   (open episode at reconnect), quarantine at the next start ⇒ one more 77 ⇒ `live`; a **live** peer failure (headless connected) ⇒ one
+   restore then quarantine ⇒ exit 77 once, then `live` with the key skipped; a peer edit of a
+   row our queued delete removed, met during the startup drain ⇒ quarantined **tainted**,
+   exit 75 at drain end, dropped at the next clean start, applied normally there; admin drop outside `outbox_blocked` ⇒ 409; injected
    `storage_error` ⇒ 202 then one log entry; injected `invalid` ⇒ `outbox_blocked` across a
    restart, admin drop, then 409; write while the socket is down ⇒ 503; budget with one
    continuous rule ⇒ `transactions.add` lands with no `rules.execute` and `rules_in_budget:
