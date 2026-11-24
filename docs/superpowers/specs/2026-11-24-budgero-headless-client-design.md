@@ -1,6 +1,6 @@
 # Budgero headless client — design
 
-Date: 24/11/2026. Status: **v29**, after twenty-eight adversarial review rounds (56 reviewers; round 27–28
+Date: 24/11/2026. **APPROVED by Federico on 25/11/2026** (v29). Status: **v29**, after twenty-eight adversarial review rounds (56 reviewers; round 27–28
 verdicts: mechanics clean, coherence "ready for a planner"; v29 applies their minors) every critical/important finding verified in code at the pin).
 Upstream proposal: https://github.com/tombadilo-bombadilo/budgero/issues/155 (no answer yet).
 Pin: upstream tag **v1.22.1 = `e40723e`**. `file:line` references are at that pin, relative to
