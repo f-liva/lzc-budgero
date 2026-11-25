@@ -491,3 +491,12 @@ it('activation does not require a master password when spaceKeySource is set', �
 - Spec coverage: §5 constraints are embodied in Tasks 1, 10, 11, 14; §6 U1/U2/U3/U6 → Tasks 3, 2, 4–6, 7 (U4/U5 explicitly not built); §7.1 → 8/9; §7.2 → 8–11, 14; §7.3 → 16; §7.4 → 15 (+12 for step 1–2, 9 for step 4); §7.5 → 14–15; §7.6 → 13, 18; §7.7 → 1, 14, 15; §7.8 → 11, 15; §8 read side only (ledger records, admin drop) → 9, 16; §9 → 17 (schemas in M2); §10 reads/status/admin → 16; §11 image → 19 (manifest M3); §12.1 → 21.
 - Deliberately deferred inside M1: the ledger verdict (`base`, `reordered`) and the write gate — the spec places them in §8/M2 and no M1 done-when needs them; the drain rule's `drained: true` marking is also M2 (no live request can exist in M1).
 - Type names used across tasks: `HeadlessState`, `StateMachine`, `Mutex`, `OutboxStorage`, `Ledger`, `LedgerRecord`, `Quarantine`, `HeadlessHttp`, `RestoreRules`, `HaltReason`, `EXIT`, `CRASH_POINTS`, `Token`, `HeadlessConfig`, `OP_POLICY` — consistent above.
+
+## Status (26/11/2026)
+
+All 22 tasks executed with subagent-driven development on fork branch `feat/headless-client`
+(worktree `~/Progetti/budgero-wt-headless`, head `ad9c64c8`, 29 commits over `v1.22.1`); final
+whole-branch review + one fix wave approved. Left to Federico: `git tag headless-v1.22.1-1 &&
+git push f-liva-fork feat/headless-client --tags`, then the clone-mode image build. Decisions
+taken during execution are in the SDD ledger (`.superpowers/sdd/…/progress.md`, 17 rulings)
+and in spec §15.

@@ -815,3 +815,36 @@ The disk is trusted at NAS-root level; the JWT travels in the WS query string (u
 esbuild alias set; exact JSON layout of `outbox.json`/`ledger.json`/`exit-info`; read
 response field names (milliunits); router choice; supervisor script details beyond the
 trap, budgets and CGI responder.
+
+## 15. Amendments from the milestone-1 implementation (26/11/2026, to fold into v30)
+
+Found by the task reviews and the bench while building M1 on fork branch `feat/headless-client`
+(29 commits over `v1.22.1`); each is already implemented as described here.
+
+- §6 U2: `getSendable()` is the **queue prefix** before the first entry whose save has not
+  resolved; a resolved save releases every id it persisted (so one rejected save cannot hold
+  the prefix forever). `deserializeMutation` and `readSnapshotVersions` are re-exported from
+  the runtime index.
+- §6 U3b: `onRemoteApplySucceeded`/`onQuarantined` are guarded observers (a throw is logged);
+  a throw from the awaited `onRemoteApplyFailed` is **not** swallowed: the headless halts.
+- §6 U3c / §7.4.10: `onRestoreCompleted` runs after the in-memory cursor is reseeded (the
+  cursor lives only in the shim, nothing reaches disk); the halt destroys the transport before
+  the reconnect, so no mutation is applied from the reseeded cursor. Wording "halt before the
+  cursor is reseeded" → "halt before any mutation is applied after the restore".
+- §7.2 `http.ts`: HTTP **429** is a transport (transient) failure, retried. `classifyFailure`
+  returns `'auth'` for 401.
+- §7.3: writes answer **503** in `not_configured` (the plan said 404; spec stands).
+- §7.4.9: a space the user cannot open (`NoWorkspaceToActivateError`, `NoAcceptedSpacesError`,
+  `ExternalKeyMismatchError`) ⇒ halt **`access_denied`**, never exit 78.
+- §7.7: new reason **`durable_write_failed`** — a `quarantine.json`/`failures.json` write failed
+  inside a hook. A halt landing while a rebuild is running cancels the exit (the process stays
+  halted).
+- §8.4: a blob-history restore published at bound 0 comes back **unbound** ⇒
+  `bootstrap_failed:unbound_blob` (per §7.4.10); "uncovered again" applies to restores bound ≥ 1.
+- §11: `BUNDLED_VERSION` = the root `package.json` version (what the server derives
+  `build_version` from when `APP_VERSION` is unset); the fork tag goes only into the OCI label.
+- §12.1: the bench proxy fronts the **headless only** (the peer talks to the server directly).
+- M2 plan items raised by the final review: single-instance lock on the config dir
+  (`worker.lock`, exit 1 `config:locked`); supervisor down-mode port must follow `config.port`;
+  log retention for `rebuilds.log`/`halts.log`; redactor key match widened (`accessToken`,
+  `apiKey`); bench scenario for a wrong `spaceId` ⇒ `access_denied`.
