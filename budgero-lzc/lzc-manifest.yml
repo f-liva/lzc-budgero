@@ -6,7 +6,7 @@ application:
 
 services:
   budgero:
-    # Upstream v1.21.5 (include nativamente PR #43 SELF_HOST_PUBLIC_IP e #44
+    # Upstream v1.22.1 (dal 26/11/2026; include nativamente PR #43 SELF_HOST_PUBLIC_IP e #44
     # XXX currency PayPal/SimpleFIN — niente più fork custom). La v1.19.0
     # migra il DB in avanti e senza ritorno: il backup del volume PRIMA
     # dell'upgrade è l'unica strada per tornare alla 1.18.
@@ -18,7 +18,7 @@ services:
     # manifest, quindi va riletto dall'output del comando e non dedotto.
     # Da 1.0.20 copy-image stampa un tag del registry, non più un digest:
     # si usa quello (il registry chiede auth, il digest non è rileggibile).
-    image: registry.lazycat.cloud/u30562882/fliva/lzc-budgero:172efac4e586c676
+    image: registry.lazycat.cloud/u30562882/fliva/lzc-budgero:e3b105dad6f2818b
     binds:
       - /lzcapp/var/data:/data
     environment:
