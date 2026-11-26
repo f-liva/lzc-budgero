@@ -60,7 +60,7 @@ services:
   # Nessuna route Lazycat: Ambrogio lo raggiunge dal tunnel Cloudflare (budgero-api.federicoliva.it,
   # dietro Cloudflare Access). restart: ignorato da Lazycat, il supervisor interno rilancia il worker.
   headless:
-    image: registry.lazycat.cloud/u30562882/fliva/budgero-headless:291e8133dab768f3
+    image: registry.lazycat.cloud/u30562882/fliva/budgero-headless:c4ab8bc6b19912d4
     user: "1001:1001"
     setup_script: mkdir -p /lzcapp/var/headless && chown -R 1001:1001 /lzcapp/var/headless
     binds:
