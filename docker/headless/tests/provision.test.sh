@@ -21,7 +21,7 @@ d=$(mktemp -d); run "$d" "$KEY32"; rc=$?
 python3 - "$d/config.json" <<'EOF' && ok "config.json has the expected fields, readOnly true" || ko "config.json fields"
 import json, sys
 c = json.load(open(sys.argv[1]))
-assert c == {"url": "http://budgero.cloud.lazycat.app.budgero.lzcapp:3001", "user": "me@example.test",
+assert c == {"url": "http://budgero.cloud.lazycat.app.budgero.lzcapp:3001/api/v1", "user": "me@example.test",
              "spaceId": "sp-1", "budgetId": 7, "readOnly": True, "allowDestructive": False, "port": 8787}, c
 EOF
 m="$(mode "$d/password") $(mode "$d/space.key") $(mode "$d/tokens")"

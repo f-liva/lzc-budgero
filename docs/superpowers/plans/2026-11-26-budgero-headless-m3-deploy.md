@@ -25,7 +25,7 @@ Commits in `lzc-budgero` (branch `main`), no AI attribution. Anything that leave
 ## Global Constraints
 
 - Production env of the headless: only `TZ=Europe/Rome` and `BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}` (§11).
-- `config.json`: `url` = `http://budgero.cloud.lazycat.app.budgero.lzcapp:3001`, `port` = `8787`, `readOnly: true`, `allowDestructive: false` for the whole M3.
+- `config.json`: `url` = `http://budgero.cloud.lazycat.app.budgero.lzcapp:3001/api/v1`, `port` = `8787`, `readOnly: true`, `allowDestructive: false` for the whole M3.
 - Secrets `password`, `space.key`, `tokens`: mode `600`, owner uid `1001`, in `/lzcapp/var/headless` (= `/lzcsys/data/appvar/cloud.lazycat.app.budgero/headless` on the host). Never in chat, logs, repo, Vikunja or BookStack.
 - Server and headless are pinned together (`version_mismatch` otherwise): any future lzc-budgero server bump ships a headless image built at the same upstream tag in the same release.
 - `services.*.restart` is ignored by Lazycat (RestartPolicy=no): the in-container supervisor is the only restarter (§5).

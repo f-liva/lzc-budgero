@@ -53,7 +53,7 @@ put() { # name, content: temp file in the same dir, then rename
   chmod 600 "$tmp"; chown "$uid" "$tmp"
   mv -f "$tmp" "$dir/$1"
 }
-put config.json "{\"url\":\"http://budgero.cloud.lazycat.app.budgero.lzcapp:3001\",\"user\":\"$user\",\"spaceId\":\"$space\",\"budgetId\":$budget,\"readOnly\":true,\"allowDestructive\":false,\"port\":8787}"
+put config.json "{\"url\":\"http://budgero.cloud.lazycat.app.budgero.lzcapp:3001/api/v1\",\"user\":\"$user\",\"spaceId\":\"$space\",\"budgetId\":$budget,\"readOnly\":true,\"allowDestructive\":false,\"port\":8787}"
 put password "$pw"
 put space.key "$key"
 put tokens "ambrogio:read:$rt

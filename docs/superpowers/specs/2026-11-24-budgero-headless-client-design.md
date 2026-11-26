@@ -686,7 +686,7 @@ Idempotency-Key: amb-2026-11-24-7f3a
 
 ## 11. Config, image, manifest
 
-`config.json`: `url` (`http://budgero.cloud.lazycat.app.budgero.lzcapp:3001`), `user`,
+`config.json`: `url` (`http://budgero.cloud.lazycat.app.budgero.lzcapp:3001/api/v1`: the API base, not the origin), `user`,
 `spaceId`, `budgetId`, `readOnly`, `allowDestructive`, `port` (8787, fixed in production).
 Secrets, mode 600, uid 1001: `password`, `space.key` (raw base64 from Settings → Push API →
 export), `tokens`. Environment in production: only `TZ=Europe/Rome` and
