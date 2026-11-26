@@ -860,3 +860,11 @@ M2 amendments (26/11/2026), from the writes implementation (fork branch `feat/he
 - §12 bench: scenario 24 (JWT refresh) needs the server minimum TTL of 1 h, so it is gated behind `HEADLESS_BENCH_JWT=1`.
 - §7.2 logging: idempotency keys appear in logs only as `sha256(key)[:12]`.
 - §7.7: a failing dequeue save halts `durable_write_failed` (before the save rejects, so our own echoed ack never becomes a remote apply failure).
+
+M3 amendments (26/11/2026), deploy decisions (plan `docs/superpowers/plans/2026-11-26-budgero-headless-m3-deploy.md`):
+
+- §3: the non-goal "public exposure" is replaced by "exposure only through the Cloudflare tunnel hostname `budgero-api.federicoliva.it`, behind a Cloudflare Access application with Service Auth (service token) and the bearer tokens; `/v1/admin/*` and `/v1/debug/*` blocked at the edge". Decided by Federico on 26/11/2026.
+- Why: Lazycat isolates lzcapps. Measured on 26/11/2026 from the Ambrogio container: `budgero.cloud.lazycat.app.budgero.lzcapp` resolves (`fd03:…`) but every connect times out; `budgero.chronos.heiyu.space` answers 307 to the Lazycat login; the tunnel hostname answers 200. Inside the Budgero package the internal name works.
+- Ambrogio sends `CF-Access-Client-Id` / `CF-Access-Client-Secret` plus `Authorization: Bearer <read token>`; the service token and the bearer token live only in Ambrogio's secret store.
+- §11: "Ambrogio reaches `http://headless.cloud.lazycat.app.budgero.lzcapp:8787`" is superseded: the tunnel (`cloudflared` on the host network) reaches that internal name, Ambrogio reaches the tunnel hostname. Operator admin calls stay inside the NAS (`lzc-docker exec … wget localhost:8787`).
+- Rejected: `lzc-docker network connect` of the Ambrogio container to the Budgero network (lost at every lpk upgrade of either app).
