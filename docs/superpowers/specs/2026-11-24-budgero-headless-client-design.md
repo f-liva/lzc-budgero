@@ -848,3 +848,15 @@ Found by the task reviews and the bench while building M1 on fork branch `feat/h
   (`worker.lock`, exit 1 `config:locked`); supervisor down-mode port must follow `config.port`;
   log retention for `rebuilds.log`/`halts.log`; redactor key match widened (`accessToken`,
   `apiKey`); bench scenario for a wrong `spaceId` ⇒ `access_denied`.
+
+M2 amendments (26/11/2026), from the writes implementation (fork branch `feat/headless-client`):
+
+- §10 `/move` accepts optional `allowOverAssign`/`allowOverspend`. This mirrors the app's confirm dialog.
+- §12 bench: the scenario "2-op PATCH whose op 2 throws in prepare" is unreachable through validated ops (only `accountid` throws in prepare, and it is not an allowed column). It is covered by an engine unit test.
+- §8.3: a ledger-answerable retry skips ownership and the services requirement. Shape validation always runs.
+- §8.3: a reordered record with intent ops never re-executes. Its intent ops become `skipped`, and the answer is 200 `reordered` + `partial`.
+- §12: the bench and the parity test live in `packages/headless/test`, not in the app's vitest.
+- §7.6: exit 77 on the out-of-band `sync_state_changed` frame itself, without waiting for upstream's delayed download.
+- §12 bench: scenario 24 (JWT refresh) needs the server minimum TTL of 1 h, so it is gated behind `HEADLESS_BENCH_JWT=1`.
+- §7.2 logging: idempotency keys appear in logs only as `sha256(key)[:12]`.
+- §7.7: a failing dequeue save halts `durable_write_failed` (before the save rejects, so our own echoed ack never becomes a remote apply failure).
