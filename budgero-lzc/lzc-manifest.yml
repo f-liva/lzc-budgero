@@ -51,3 +51,23 @@ services:
       # Vuota = bank-sync non funzionante, tutto il resto sì.
       # - SELF_HOST_PUBLIC_IP=mio-ddns.esempio.com
       # - CURRENCYLAYER_API_KEY=  # opzionale, abilita multi-currency rates
+
+  # Client headless (fork f-liva/budgero, spec docs/superpowers/specs/2026-11-24-budgero-headless-client-design.md).
+  # Peer della web-app senza UI: API REST su :8787, DB solo in memoria, non carica mai snapshot.
+  # Config e segreti (config.json, password, space.key, tokens; mode 600, uid 1001) in
+  # /lzcapp/var/headless, scritti da docker/headless/provision.sh: senza config resta not_configured.
+  # Va aggiornato INSIEME al server: build dallo stesso tag upstream, altrimenti halt version_mismatch.
+  # Nessuna route Lazycat: Ambrogio lo raggiunge dal tunnel Cloudflare (budgero-api.federicoliva.it,
+  # dietro Cloudflare Access). restart: ignorato da Lazycat, il supervisor interno rilancia il worker.
+  headless:
+    image: registry.lazycat.cloud/u30562882/fliva/budgero-headless:291e8133dab768f3
+    user: "1001:1001"
+    setup_script: mkdir -p /lzcapp/var/headless && chown -R 1001:1001 /lzcapp/var/headless
+    binds:
+      - /lzcapp/var/headless:/lzcapp/var/headless
+    environment:
+      - TZ=Europe/Rome
+      - BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}
+    health_check:
+      test: [CMD, wget, -qO-, "http://localhost:8787/healthz"]
+      start_period: 120s

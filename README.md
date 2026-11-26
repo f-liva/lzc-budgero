@@ -151,6 +151,29 @@ dominio di questa app (es. `budgero.chronos.heiyu.space`),
 `LAZYCAT_BOX_DOMAIN` quello del box. Mai inchiodare un dominio nel manifest —
 romperebbe ogni altro box.
 
+## Client headless
+
+Dal pacchetto 1.0.22 c'è un secondo servizio, `headless`: un client Budgero senza interfaccia
+(fork `f-liva/budgero`, branch `feat/headless-client`) che tiene il budget in memoria e lo espone
+con un'API REST sulla porta 8787 del container. Spec:
+`docs/superpowers/specs/2026-11-24-budgero-headless-client-design.md`; piano di deploy:
+`docs/superpowers/plans/2026-11-26-budgero-headless-m3-deploy.md`.
+
+- **Config e segreti** in `/lzcapp/var/headless` (host:
+  `/lzcsys/data/appvar/cloud.lazycat.app.budgero/headless`), scritti da
+  `docker/headless/provision.sh` lanciato da te in SSH: password e `space.key` non passano mai in
+  chiaro. Senza config il servizio resta `not_configured` e non fa nulla.
+- **Sola lettura** finché `config.json` ha `readOnly: true` (default del provisioning).
+- **Raggiungibilità:** nessuna route Lazycat. Le app Lazycat sono isolate tra loro, quindi Ambrogio
+  passa dal tunnel Cloudflare (`budgero-api.federicoliva.it`, dietro Cloudflare Access con service
+  token, più il bearer token). `/v1/admin` e `/v1/debug` sono bloccati sul bordo: le chiamate admin
+  si fanno dal NAS, `lzc-docker exec cloudlazycatappbudgero-headless-1 wget -qO- --header "Authorization: Bearer …" localhost:8787/v1/status`.
+- **Upgrade:** server e headless vanno aggiornati **insieme**, con l'immagine headless costruita
+  allo stesso tag upstream del server (`docker/headless/README.md`). Con versioni diverse
+  l'headless si ferma in `version_mismatch`.
+- **Settimana di osservazione:** `bash docker/headless/observe.sh --nas --since <ISO>` giudica i
+  quattro criteri dello spec §12.3 dai log del NAS.
+
 ## Limitazioni note
 
 ### Doppio login (Lazycat OIDC + Budgero)
