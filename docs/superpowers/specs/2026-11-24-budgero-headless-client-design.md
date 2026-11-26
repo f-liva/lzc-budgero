@@ -868,3 +868,10 @@ M3 amendments (26/11/2026), deploy decisions (plan `docs/superpowers/plans/2026-
 - Ambrogio sends `CF-Access-Client-Id` / `CF-Access-Client-Secret` plus `Authorization: Bearer <read token>`; the service token and the bearer token live only in Ambrogio's secret store.
 - §11: "Ambrogio reaches `http://headless.cloud.lazycat.app.budgero.lzcapp:8787`" is superseded: the tunnel (`cloudflared` on the host network) reaches that internal name, Ambrogio reaches the tunnel hostname. Operator admin calls stay inside the NAS (`lzc-docker exec … wget localhost:8787`).
 - Rejected: `lzc-docker network connect` of the Ambrogio container to the Budgero network (lost at every lpk upgrade of either app).
+
+M3 amendment 2 (26/11/2026, evening), supersedes the Cloudflare route above:
+- Ambrogio reaches the headless at `http://172.18.0.1:8787` through a rule of the Lazycat **Forward** app (`cloudlazycatappforward-*`): export `VIRTUAL_INTERFACE` `lzc_docker` port 8787 → target `LZCAPP` `headless.cloud.lazycat.app.budgero.lzcapp:8787`. Federico created it on 26/11/2026.
+- The export listens only on the `lzc_docker` bridge address (`172.18.0.1`): reachable from containers on the NAS, not from the LAN (`192.168.8.115:8787` refuses) nor from the internet. No public hostname, no Cloudflare Access, no edge block on `/v1/admin` `/v1/debug`; the bearer tokens are the only gate, as §3 originally intended.
+- Verified from `cloudlazycatappambrogio-ambrogio-1`: no bearer → 401; read bearer on `/v1/accounts` → 200 (35 accounts).
+- The rule lives in the Forward app's config and targets the lzcapp name, so it survives lpk upgrades of either app. The Forward UI may show it as `retrying` while it forwards correctly (observed 26/11/2026).
+- Plan Task 5 (Cloudflare) is dropped.

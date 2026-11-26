@@ -92,6 +92,8 @@ Commits in `lzc-budgero` (branch `main`), no AI attribution. Anything that leave
 
 ### Task 5: Public hostname behind Cloudflare Access (gated, Federico in the dashboard)
 
+> **Dropped (26/11/2026):** replaced by a Lazycat Forward rule on the `lzc_docker` interface, see spec §15 "M3 amendment 2". Ambrogio uses `http://172.18.0.1:8787`; verified 401 without bearer, 200 with the read token.
+
 - [ ] **Step 1:** Cloudflare One → Networks → Tunnels → the NAS tunnel → Public hostname: `budgero-api.federicoliva.it` → `http://headless.cloud.lazycat.app.budgero.lzcapp:8787`. (Checked first from the `cloudflared` container: `wget -qO- http://headless.cloud.lazycat.app.budgero.lzcapp:8787/healthz` answers.)
 - [ ] **Step 2:** Access → Applications → self-hosted `budgero-api.federicoliva.it`, policy **Service Auth** with a new service token "ambrogio-headless" (Client ID/Secret stored only in Ambrogio's secret store); a second application on path `budgero-api.federicoliva.it/v1/admin` and `/v1/debug` with policy **Block** (or a WAF custom rule blocking those paths).
 - [ ] **Step 3: Verification from outside (WSL) and from the Ambrogio container** (Review Focus 5): no Access headers ⇒ 403 from Cloudflare (never the headless JSON); Access headers + no bearer ⇒ 401 `unauthorized`; Access headers + read bearer ⇒ 200 `/v1/status` with `state: live`; Access headers + admin bearer on `/v1/admin/quarantine/x/ack` ⇒ blocked at the edge (403 Cloudflare page, not the headless 404). Record the four status codes.
