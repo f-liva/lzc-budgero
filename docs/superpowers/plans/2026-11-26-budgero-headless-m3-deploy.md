@@ -100,6 +100,8 @@ Commits in `lzc-budgero` (branch `main`), no AI attribution. Anything that leave
 
 ### Task 6: Spec §12.3 checks (observations, not gates)
 
+> **Status 26/11/2026:** Step 1 — `lpk-manager stop` writes no record at all (no 143, no 137): the container prints nothing on stop, so TERM does not reach the entrypoint (pid 23 under `/lzcinit`) or Lazycat kills it; harmless read-only, to be resolved before Task 8. Step 2 — `healthy` 50 s after start, health log `[1,1,1,1,0]` inside `start_period`, never `unhealthy`. Steps 3–5 — Vikunja 901 (27/11 boot + spot check), 903 (unhealthy observation).
+
 - [ ] **Step 1: TERM forwarding:** `lpk-manager stop cloud.lazycat.app.budgero` then start ⇒ `rebuilds.log` last line `code 143` before the stop (supervisor got TERM through `lzcinit`). If it shows 137, note it (SIGKILL path; acceptable, recorded).
 - [ ] **Step 2: health_check:** `lzc-docker inspect cloudlazycatappbudgero-headless-1 --format '{{json .State.Health}}'` ⇒ `healthy` after start; `start_period` honoured (no `unhealthy` in the first 120 s while `bootstrapping`).
 - [ ] **Step 3: unhealthy secondary service (observation only, nothing provoked):** during Task 4 Step 1 the headless sits in `not_configured` (200) and during bootstrap in `bootstrapping` (200); the first natural 503 will be a halt or a storm. When one happens during the week, record from `lzc-docker ps`/`inspect` whether Lazycat leaves the `budgero` service and the app running while `headless` is `unhealthy`. Note the result in the runbook.
@@ -107,6 +109,8 @@ Commits in `lzc-budgero` (branch `main`), no AI attribution. Anything that leave
 - [ ] **Step 5: First spot check:** `/v1/months/<current>` vs the web app (Ready to Assign and 3 category `available` values), recorded.
 
 ### Task 7: Observation tooling, runbook, reminders
+
+> **Status 26/11/2026:** done. Runbook BookStack Chronos page 193; Vikunja 902 (day 3, 29/11) and 903 (day 7, 03/12); baseline `observe.sh --since 2026-11-26T18:43:00Z` 4/4 PASS.
 
 **Files:**
 - Create: `docker/headless/observe.sh`, `docker/headless/tests/observe.test.sh`
