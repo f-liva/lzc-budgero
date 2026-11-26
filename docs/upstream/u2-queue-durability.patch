@@ -1,6 +1,6 @@
-From 358228789317cbde5dffaddd8a1da738a075e602 Mon Sep 17 00:00:00 2001
-From: Federico Liva <federico.liva@espero.it>
-Date: Thu, 26 Nov 2026 11:01:46 +0100
+From c2575b2b017bbd3928dc567b69bdda2104bf8688 Mon Sep 17 00:00:00 2001
+From: Federico Liva <346224+f-liva@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:23:42 +0100
 Subject: [PATCH] fix(runtime): keep non-durable offline-queue entries unsent;
  injectable queue storage
 
