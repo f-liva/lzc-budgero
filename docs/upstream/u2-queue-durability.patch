@@ -1,0 +1,430 @@
+From 358228789317cbde5dffaddd8a1da738a075e602 Mon Sep 17 00:00:00 2001
+From: Federico Liva <federico.liva@espero.it>
+Date: Thu, 26 Nov 2026 11:01:46 +0100
+Subject: [PATCH] fix(runtime): keep non-durable offline-queue entries unsent;
+ injectable queue storage
+
+An entry pushed to the in-memory offline queue was sendable before
+storage.save resolved. A crash between send and save lost the entry
+locally while the server had applied it, and a failed save could resend
+a mutation that was never durable.
+
+The queue now exposes only the prefix before the first non-durable entry
+to the send path. A resolved save releases every id it persisted, not
+just the one that triggered it. Queue storage is injectable through the
+runtime context so the behaviour is testable.
+
+Refs #155
+---
+ .../coordinator/reconnection-service.test.ts  |  12 ++
+ .../src/coordinator/reconnection-service.ts   |   4 +-
+ .../coordinator/runtime-context-factory.ts    |   5 +-
+ .../coordinator/runtime-coordinator-types.ts  |   2 +
+ .../src/coordinator/runtime-coordinator.ts    |   1 +
+ .../offline-queue.persisting.test.ts          | 151 ++++++++++++++++++
+ .../src/offline-queue/offline-queue.ts        |  25 ++-
+ packages/runtime/src/offline-queue/storage.ts |   2 +-
+ 8 files changed, 196 insertions(+), 6 deletions(-)
+ create mode 100644 packages/runtime/src/offline-queue/offline-queue.persisting.test.ts
+
+diff --git a/packages/runtime/src/coordinator/reconnection-service.test.ts b/packages/runtime/src/coordinator/reconnection-service.test.ts
+index 5b89c6ee..80e809ff 100644
+--- a/packages/runtime/src/coordinator/reconnection-service.test.ts
++++ b/packages/runtime/src/coordinator/reconnection-service.test.ts
+@@ -84,6 +84,11 @@ describe('ReconnectionService', () => {
+             createQueueItem('m2', 'other'),
+             createQueueItem('m3', 'space_1'),
+           ],
++          getSendable: () => [
++            createQueueItem('m1', 'space_1'),
++            createQueueItem('m2', 'other'),
++            createQueueItem('m3', 'space_1'),
++          ],
+           getStale: async () => [],
+           noteSent,
+         },
+@@ -170,6 +175,7 @@ describe('ReconnectionService', () => {
+         offlineQueue: {
+           hasQueued: async () => true,
+           getQueue: async () => [createQueueItem('m1', 'space_1')],
++          getSendable: () => [createQueueItem('m1', 'space_1')],
+           getStale: async () => [],
+           noteSent: vi.fn(),
+         },
+@@ -301,6 +307,7 @@ describe('ReconnectionService', () => {
+         offlineQueue: {
+           hasQueued: async () => false,
+           getQueue: async () => [],
++          getSendable: () => [],
+           getStale: async () => [],
+           noteSent: () => {},
+         },
+@@ -684,6 +691,7 @@ describe('ReconnectionService', () => {
+       offlineQueue: {
+         hasQueued: async () => true,
+         getQueue: async () => [createQueueItem('m1', 's1')],
++        getSendable: () => [createQueueItem('m1', 's1')],
+         getStale: async () => [],
+         noteSent: vi.fn(),
+       },
+@@ -752,6 +760,7 @@ describe('ReconnectionService', () => {
+       offlineQueue: {
+         hasQueued: async () => true,
+         getQueue: async () => [createQueueItem('m1', 's1')],
++        getSendable: () => [createQueueItem('m1', 's1')],
+         getStale: async () => [],
+         noteSent: vi.fn(),
+       },
+@@ -839,6 +848,7 @@ describe('ReconnectionService', () => {
+         offlineQueue: {
+           hasQueued: async () => false,
+           getQueue: async () => [],
++          getSendable: () => [],
+           getStale: async () => [],
+           noteSent: vi.fn(),
+         },
+@@ -916,6 +926,7 @@ describe('ReconnectionService', () => {
+         offlineQueue: {
+           hasQueued: async () => true,
+           getQueue: async () => [createQueueItem('m1', 's1')],
++          getSendable: () => [createQueueItem('m1', 's1')],
+           getStale: async () => [],
+           noteSent: vi.fn(),
+         },
+@@ -962,6 +973,7 @@ describe('ReconnectionService', () => {
+         offlineQueue: {
+           hasQueued: async () => true,
+           getQueue: async () => [],
++          getSendable: () => [],
+           getStale: async () => [createQueueItem('m1', 's1'), createQueueItem('m2', 's1')],
+           noteSent,
+         },
+diff --git a/packages/runtime/src/coordinator/reconnection-service.ts b/packages/runtime/src/coordinator/reconnection-service.ts
+index 0c24f63e..e0baab15 100644
+--- a/packages/runtime/src/coordinator/reconnection-service.ts
++++ b/packages/runtime/src/coordinator/reconnection-service.ts
+@@ -28,6 +28,7 @@ interface ReconnectionContext {
+   offlineQueue: {
+     hasQueued(): Promise<boolean>;
+     getQueue(): Promise<MutationPayload[]>;
++    getSendable(): MutationPayload[];
+     getStale(thresholdMs: number): Promise<MutationPayload[]>;
+     noteSent(mutationId: string): void;
+   };
+@@ -242,7 +243,8 @@ export class ReconnectionService {
+   }
+ 
+   private async replayQueueViaSync(ctx: ReconnectionContext): Promise<void> {
+-    const queue = await ctx.offlineQueue.getQueue();
++    await ctx.offlineQueue.getQueue(); // ensure loaded
++    const queue = ctx.offlineQueue.getSendable();
+     if (!queue.length) return;
+ 
+     ctx.sync.updateSyncStatus({ isSyncing: true, syncError: null });
+diff --git a/packages/runtime/src/coordinator/runtime-context-factory.ts b/packages/runtime/src/coordinator/runtime-context-factory.ts
+index 8f7e0749..41189119 100644
+--- a/packages/runtime/src/coordinator/runtime-context-factory.ts
++++ b/packages/runtime/src/coordinator/runtime-context-factory.ts
+@@ -14,7 +14,7 @@ import { persistDatabase } from '../utils/persist-database';
+ import { scopedLogger, type RuntimeComponentLogFn } from '../logging';
+ import { MutationExecutor } from '../mutation-executor';
+ import { DatabaseSync, DatabaseLoader, type MigrationRunner } from '../database-sync';
+-import { OfflineQueue } from '../offline-queue';
++import { OfflineQueue, type QueueStorage } from '../offline-queue';
+ import { SyncTransport, SnapshotUnavailableError } from '../sync-transport';
+ import { reapplyQueueAfterRestore } from './restore-invariant';
+ import { LocalPersistScheduler } from './local-persist-scheduler';
+@@ -43,6 +43,7 @@ export interface RuntimeContext {
+ }
+ 
+ export interface RuntimeContextFactoryDeps {
++  queueStorage?: QueueStorage;
+   getToken(): Promise<string | null>;
+   executeOp(
+     op: string,
+@@ -198,7 +199,7 @@ export class RuntimeContextFactory {
+     }
+ 
+     const dbLoader = new DatabaseLoader(this.migrationRunner);
+-    const offlineQueue = new OfflineQueue(params.spaceId);
++    const offlineQueue = new OfflineQueue(params.spaceId, this.deps.queueStorage);
+     offlineQueueRef = offlineQueue;
+ 
+     const sync = new SyncTransport(params.spaceId, {
+diff --git a/packages/runtime/src/coordinator/runtime-coordinator-types.ts b/packages/runtime/src/coordinator/runtime-coordinator-types.ts
+index 79be7a09..c9a49a55 100644
+--- a/packages/runtime/src/coordinator/runtime-coordinator-types.ts
++++ b/packages/runtime/src/coordinator/runtime-coordinator-types.ts
+@@ -14,6 +14,8 @@ export type StateChangeListener = (
+ ) => void;
+ 
+ export interface RuntimeCoordinatorDeps {
++  /** Offline-queue persistence; defaults to IndexedDB. */
++  queueStorage?: import('../offline-queue').QueueStorage;
+   getToken(): Promise<string | null>;
+ 
+   checkApiHealth(): Promise<boolean>;
+diff --git a/packages/runtime/src/coordinator/runtime-coordinator.ts b/packages/runtime/src/coordinator/runtime-coordinator.ts
+index ee48f40f..976c88a9 100644
+--- a/packages/runtime/src/coordinator/runtime-coordinator.ts
++++ b/packages/runtime/src/coordinator/runtime-coordinator.ts
+@@ -94,6 +94,7 @@ export class RuntimeCoordinator {
+     this.spaceRegistry = new SpaceRegistry();
+     const contextFactory = new RuntimeContextFactory(
+       {
++        queueStorage: deps.queueStorage,
+         getToken: () => deps.getToken(),
+         executeOp: (op, payload, context) => deps.executeOp(op, payload, context),
+         getUndoSpec: (op) => deps.getUndoSpec(op),
+diff --git a/packages/runtime/src/offline-queue/offline-queue.persisting.test.ts b/packages/runtime/src/offline-queue/offline-queue.persisting.test.ts
+new file mode 100644
+index 00000000..5a62bfd8
+--- /dev/null
++++ b/packages/runtime/src/offline-queue/offline-queue.persisting.test.ts
+@@ -0,0 +1,151 @@
++import { describe, expect, it, vi } from 'vitest';
++import { OfflineQueue } from './offline-queue';
++import { InMemoryQueueStorage } from './storage';
++import { RuntimeContextFactory } from '../coordinator/runtime-context-factory';
++
++function mutation(id: string) {
++  return {
++    id,
++    baseVersion: 0,
++    op: 'x.y',
++    args: { a: 1 },
++    timestamp: new Date('2024-01-01T00:00:00Z'),
++    spaceId: 's1',
++  };
++}
++
++function deferred() {
++  let resolve!: () => void;
++  let reject!: (e: Error) => void;
++  const promise = new Promise<void>((res, rej) => {
++    resolve = res;
++    reject = rej;
++  });
++  return { promise, resolve, reject };
++}
++
++describe('OfflineQueue persisting', () => {
++  it('an entry is not sendable until storage.save resolves', async () => {
++    const storage = new InMemoryQueueStorage();
++    const gate = deferred();
++    vi.spyOn(storage, 'save').mockReturnValue(gate.promise);
++    const queue = new OfflineQueue('s1', storage);
++    const addPromise = queue.add(mutation('m1'));
++    await Promise.resolve(); // let add() pass ensureLoaded and push (save is pending)
++    await queue.getQueue();
++    expect(queue.getSendable()).toEqual([]);
++    expect(await queue.getQueue()).toHaveLength(1);
++    expect(await queue.getUnsent()).toEqual([]);
++    expect(await queue.getStale(0)).toEqual([]);
++
++    gate.resolve();
++    await addPromise;
++    expect(queue.getSendable()).toHaveLength(1);
++    expect(await queue.getUnsent()).toHaveLength(1);
++  });
++
++  it('nothing behind a held entry is sendable (FIFO); a later resolved save (which wrote m1 too) releases both', async () => {
++    const storage = new InMemoryQueueStorage();
++    const gate1 = deferred();
++    const gate2 = deferred();
++    vi.spyOn(storage, 'save').mockReturnValueOnce(gate1.promise).mockReturnValueOnce(gate2.promise);
++    const queue = new OfflineQueue('s1', storage);
++    await queue.getQueue();
++
++    const first = queue.add(mutation('m1'));
++    const second = queue.add(mutation('m2'));
++    await Promise.resolve();
++    expect(await queue.getQueue()).toHaveLength(2);
++    expect(queue.getSendable()).toEqual([]);
++    expect(await queue.getUnsent()).toEqual([]);
++
++    gate2.resolve();
++    await second;
++    expect(queue.getSendable().map((m) => m.id)).toEqual(['m1', 'm2']);
++    gate1.resolve();
++    await first;
++    expect(queue.getSendable().map((m) => m.id)).toEqual(['m1', 'm2']);
++  });
++
++  it('a rejected save keeps the id in persisting', async () => {
++    const storage = new InMemoryQueueStorage();
++    vi.spyOn(storage, 'save').mockRejectedValue(new Error('disk full'));
++    const queue = new OfflineQueue('s1', storage);
++
++    await expect(queue.add(mutation('m1'))).rejects.toThrow('disk full');
++    expect(queue.getSendable()).toEqual([]);
++    expect(await queue.getQueue()).toHaveLength(1);
++    expect(await queue.getUnsent()).toEqual([]);
++    expect(await queue.getStale(0)).toEqual([]);
++  });
++
++  it('a later save that resolves releases the ids it persisted (rejected first save no longer holds the queue)', async () => {
++    const storage = new InMemoryQueueStorage();
++    const save = vi.spyOn(storage, 'save').mockRejectedValueOnce(new Error('disk full'));
++    const queue = new OfflineQueue('s1', storage);
++
++    await expect(queue.add(mutation('m1'))).rejects.toThrow('disk full');
++    await queue.add(mutation('m2'));
++    expect(save.mock.calls[1][1].map((m) => m.id)).toEqual(['m1', 'm2']); // m1 is on disk now
++    expect(queue.getSendable().map((m) => m.id)).toEqual(['m1', 'm2']);
++    expect((await queue.getUnsent()).map((m) => m.id)).toEqual(['m1', 'm2']);
++    expect((await queue.getStale(0)).map((m) => m.id)).toEqual(['m1', 'm2']);
++  });
++
++  it('a save does not release an id pushed after its snapshot', async () => {
++    const storage = new InMemoryQueueStorage();
++    const gate1 = deferred();
++    const gate2 = deferred();
++    vi.spyOn(storage, 'save').mockReturnValueOnce(gate1.promise).mockReturnValueOnce(gate2.promise);
++    const queue = new OfflineQueue('s1', storage);
++    await queue.getQueue();
++
++    const first = queue.add(mutation('m1'));
++    const second = queue.add(mutation('m2')); // pushed while m1's save is in flight
++    await Promise.resolve();
++    gate1.resolve();
++    await first;
++    expect(queue.getSendable().map((m) => m.id)).toEqual(['m1']);
++    gate2.resolve();
++    await second;
++    expect(queue.getSendable().map((m) => m.id)).toEqual(['m1', 'm2']);
++  });
++
++  it('clear() and setQueue() empty persisting', async () => {
++    const storage = new InMemoryQueueStorage();
++    vi.spyOn(storage, 'save').mockRejectedValueOnce(new Error('disk full'));
++    const queue = new OfflineQueue('s1', storage);
++    const held = () => (queue as unknown as { persisting: Set<string> }).persisting.size;
++
++    await expect(queue.add(mutation('m1'))).rejects.toThrow('disk full');
++    expect(held()).toBe(1);
++    await queue.clear();
++    expect(held()).toBe(0);
++
++    vi.spyOn(storage, 'save').mockRejectedValueOnce(new Error('disk full'));
++    await expect(queue.add(mutation('m2'))).rejects.toThrow('disk full');
++    expect(held()).toBe(1);
++    await queue.setQueue([mutation('m2')]);
++    expect(held()).toBe(0);
++    expect(queue.getSendable().map((m) => m.id)).toEqual(['m2']);
++  });
++
++  it('coordinator passes deps.queueStorage to new OfflineQueue', async () => {
++    const queueStorage = new InMemoryQueueStorage();
++    const load = vi.spyOn(queueStorage, 'load');
++    const factory = new RuntimeContextFactory({ queueStorage } as never);
++    const ctx = factory.createOnlineContext({
++      spaceId: 'space_1',
++      generation: 1,
++      db: {} as never,
++      encryption: {} as never,
++      passphrase: 'p',
++      hydratedFromServer: true,
++      localPersistenceCipher: {} as never,
++      onRemoteMutation: vi.fn(async () => undefined),
++      onSyncConnectionChange: vi.fn(),
++    } as never);
++    await ctx.offlineQueue.getQueue();
++    expect(load).toHaveBeenCalledWith('space_1');
++  });
++});
+diff --git a/packages/runtime/src/offline-queue/offline-queue.ts b/packages/runtime/src/offline-queue/offline-queue.ts
+index 299000cf..78406c1e 100644
+--- a/packages/runtime/src/offline-queue/offline-queue.ts
++++ b/packages/runtime/src/offline-queue/offline-queue.ts
+@@ -27,6 +27,9 @@ export class OfflineQueue {
+   /** Transient last-send timestamps; drives the unacked-resend sweep. */
+   private sentAt = new Map<string, number>();
+ 
++  /** Ids whose storage.save has not resolved: not durable, so never sent. */
++  private persisting = new Set<string>();
++
+   private storage: QueueStorage;
+ 
+   private loaded = false;
+@@ -66,7 +69,12 @@ export class OfflineQueue {
+       mutation.spaceId = this.spaceId;
+     }
+     this.queue.push(mutation);
++    this.persisting.add(mutation.id);
++    const saved = this.queue.map((m) => m.id); // before the await: later pushes are not in this save
+     await this.storage.save(this.spaceId, this.queue);
++    // Not in a finally: a rejected save leaves its entries non-durable and unsent. A resolved one
++    // proves every entry it wrote durable, including one held by an earlier rejected save.
++    for (const id of saved) this.persisting.delete(id);
+     logRuntime('debug', 'OfflineQueue', 'Mutation queued', {
+       id: mutation.id,
+       op: mutation.op,
+@@ -83,6 +91,17 @@ export class OfflineQueue {
+     return [...this.queue];
+   }
+ 
++  /**
++   * The queue prefix up to (excluding) the first entry whose persist has not
++   * resolved: nothing behind a non-durable entry is sendable, or a later
++   * mutation would overtake it (FIFO/causal order). Call after the queue is
++   * loaded (any async accessor awaits that).
++   */
++  getSendable(): MutationPayload[] {
++    const held = this.queue.findIndex((m) => this.persisting.has(m.id));
++    return held === -1 ? [...this.queue] : this.queue.slice(0, held);
++  }
++
+   /**
+    * Check if there are queued mutations.
+    */
+@@ -131,7 +150,7 @@ export class OfflineQueue {
+    */
+   async getUnsent(): Promise<MutationPayload[]> {
+     await this.ensureLoaded();
+-    return this.queue.filter((m) => !this.sentAt.has(m.id));
++    return this.getSendable().filter((m) => !this.sentAt.has(m.id));
+   }
+ 
+   /**
+@@ -140,7 +159,7 @@ export class OfflineQueue {
+    */
+   async getStale(thresholdMs: number, now: number = Date.now()): Promise<MutationPayload[]> {
+     await this.ensureLoaded();
+-    return this.queue.filter((m) => {
++    return this.getSendable().filter((m) => {
+       if (m.spaceId && m.spaceId !== this.spaceId) return false;
+       const last = this.sentAt.get(m.id);
+       return last === undefined || now - last >= thresholdMs;
+@@ -271,6 +290,7 @@ export class OfflineQueue {
+    */
+   async clear(): Promise<void> {
+     this.queue = [];
++    this.persisting.clear();
+     await this.storage.clear(this.spaceId);
+   }
+ 
+@@ -279,6 +299,7 @@ export class OfflineQueue {
+    */
+   async setQueue(remaining: MutationPayload[]): Promise<void> {
+     this.queue = remaining;
++    this.persisting.clear();
+     await this.storage.save(this.spaceId, this.queue);
+   }
+ 
+diff --git a/packages/runtime/src/offline-queue/storage.ts b/packages/runtime/src/offline-queue/storage.ts
+index be14f28f..59c71130 100644
+--- a/packages/runtime/src/offline-queue/storage.ts
++++ b/packages/runtime/src/offline-queue/storage.ts
+@@ -37,7 +37,7 @@ export interface QueueStorage {
+   clear(spaceId: string): Promise<void>;
+ }
+ 
+-function deserializeMutation(m: Record<string, unknown>, spaceId: string): MutationPayload {
++export function deserializeMutation(m: Record<string, unknown>, spaceId: string): MutationPayload {
+   const version = typeof m.v === 'number' ? m.v : 1;
+   // Entries queued by a pre-milliunit build hold decimal-money args; upgrade
+   // them at load so replay after an app update writes the current format.
+-- 
+2.50.1
+
