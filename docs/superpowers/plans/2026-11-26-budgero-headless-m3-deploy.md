@@ -100,7 +100,7 @@ Commits in `lzc-budgero` (branch `main`), no AI attribution. Anything that leave
 
 ### Task 6: Spec §12.3 checks (observations, not gates)
 
-> **Status 26/11/2026:** Step 1 — `lpk-manager stop` writes no record at all (no 143, no 137): the container prints nothing on stop, so TERM does not reach the entrypoint (pid 23 under `/lzcinit`) or Lazycat kills it; harmless read-only, to be resolved before Task 8. Step 2 — `healthy` 50 s after start, health log `[1,1,1,1,0]` inside `start_period`, never `unhealthy`. Steps 3–5 — Vikunja 901 (27/11 boot + spot check), 903 (unhealthy observation).
+> **Status 26/11/2026:** Step 1 — `lpk-manager stop` writes no record at all (no 143, no 137): the container prints nothing on stop, so TERM does not reach the entrypoint (pid 23 under `/lzcinit`) or Lazycat kills it; harmless read-only, to be resolved before Task 8. Step 2 — `healthy` 50 s after start, health log `[1,1,1,1,0]` inside `start_period`, never `unhealthy`. Step 5 — spot check passed 26/11/2026: readyToAssign and 3 category `Available` values match the web app (amounts are milli-euro). Steps 3–4 — Vikunja 901 (27/11 boot), 903 (unhealthy observation).
 
 - [ ] **Step 1: TERM forwarding:** `lpk-manager stop cloud.lazycat.app.budgero` then start ⇒ `rebuilds.log` last line `code 143` before the stop (supervisor got TERM through `lzcinit`). If it shows 137, note it (SIGKILL path; acceptable, recorded).
 - [ ] **Step 2: health_check:** `lzc-docker inspect cloudlazycatappbudgero-headless-1 --format '{{json .State.Health}}'` ⇒ `healthy` after start; `start_period` honoured (no `unhealthy` in the first 120 s while `bootstrapping`).
