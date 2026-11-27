@@ -421,8 +421,7 @@ with per-op states incl. `failed`/`skipped`; never 200 for an op the server has 
 from the triggering request until exit. In-process re-activation is not used (re-activating
 the same space keeps the old transport alive, `runtime-lifecycle-service.ts:176-179`).
 
-**Supervisor** (`entrypoint.sh`, child of Lazycat's `lzcinit` because `setup_script` is
-used): relaunches on 75/76/77/78 (78 with exponential backoff 5 s → 5 min, `--backoff-ms` override
+**Supervisor** (`entrypoint.sh`, pid 1 of the container: no `setup_script`, see M3 amendment 3): relaunches on 75/76/77/78 (78 with exponential backoff 5 s → 5 min, `--backoff-ms` override
 for the bench; "consecutive" = no child with `uptime_s ≥ 600` in between; 20 consecutive ⇒
 stays down `bootstrap_retries_exhausted`), stays down otherwise, traps `TERM`/`INT` and forwards them
 (`trap 'kill -TERM "$child"; wait "$child"; exit 143' TERM INT`), is the **only writer** of
@@ -704,7 +703,6 @@ our thin wrapper over the upstream release).
 headless:
   image: registry.lazycat.cloud/<mirror>/fliva/budgero-headless:<hash>
   user: "1001:1001"
-  setup_script: mkdir -p /lzcapp/var/headless && chown -R 1001:1001 /lzcapp/var/headless
   binds: [/lzcapp/var/headless:/lzcapp/var/headless]
   environment: [TZ=Europe/Rome, "BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}"]
   health_check: {test: [CMD, wget, -qO-, "http://localhost:8787/healthz"], start_period: 120s}
@@ -875,3 +873,8 @@ M3 amendment 2 (26/11/2026, evening), supersedes the Cloudflare route above:
 - Verified from `cloudlazycatappambrogio-ambrogio-1`: no bearer → 401; read bearer on `/v1/accounts` → 200 (35 accounts).
 - The rule lives in the Forward app's config and targets the lzcapp name, so it survives lpk upgrades of either app. The Forward UI may show it as `retrying` while it forwards correctly (observed 26/11/2026).
 - Plan Task 5 (Cloudflare) is dropped.
+
+M3 amendment 3 (27/11/2026), I-4 of the final review:
+- `setup_script` is removed from the `headless` service. With it Lazycat runs `/lzcinit/<pkg> -setup-script …` as pid 1 and the supervisor as its child; measured on 26/11/2026: `lzc-docker kill -s TERM` makes the container exit 2 at once with no output from the supervisor or the worker, and `lpk-manager stop` sends exactly that TERM (`docker events`: kill 15, stop, die, destroy). So no stop was ever clean and no 143 was recorded.
+- Without `setup_script` the image entrypoint is pid 1 (`/bin/sh /app/entrypoint.sh`, worker as child). Verified on lzc-budgero 1.0.25: stop records `{"code":143,"reason":"term"}`, `worker.lock` is removed, restart is `live` in 3 s.
+- Cost: nothing creates or chowns `/lzcapp/var/headless` any more. On a fresh install the bind dir is root-owned until `provision.sh` (run as root) chowns it to 1001 (`chown "$uid" "$dir"`); before that the service cannot write its logs.

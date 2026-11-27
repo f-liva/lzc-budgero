@@ -22,8 +22,9 @@ if h:
           f"image must be a registry.lazycat.cloud tag, got {img!r}")
     check("budgero-headless" in img, f"image must be the headless image, got {img!r}")
     check(str(h.get("user")) == "1001:1001", f"user must be 1001:1001, got {h.get('user')!r}")
-    check(h.get("setup_script", "").strip() ==
-          "mkdir -p /lzcapp/var/headless && chown -R 1001:1001 /lzcapp/var/headless", "setup_script differs")
+    # setup_script makes /lzcinit pid 1, and lzcinit does not forward TERM: the supervisor would never
+    # see a stop (measured 26/11/2026, plan M3 I-4). provision.sh chowns the dir instead.
+    check("setup_script" not in h, "setup_script must be absent: lzcinit swallows TERM")
     check(h.get("binds") == ["/lzcapp/var/headless:/lzcapp/var/headless"], f"binds differ: {h.get('binds')!r}")
     check(h.get("environment") == ["TZ=Europe/Rome", "BUDGERO_ORIGIN=https://${LAZYCAT_APP_DOMAIN}"],
           f"environment must be exactly TZ + BUDGERO_ORIGIN, got {h.get('environment')!r}")
@@ -41,5 +42,5 @@ if fails:
     print("FAIL:\n  " + "\n  ".join(fails)); sys.exit(1)
 print("PASS: manifest headless service")
 EOF
-grep -q '^version: 1.0.24$' "$here/package.yml" || { echo "FAIL: package.yml version must be 1.0.24"; exit 1; }
-echo "PASS: package.yml 1.0.24"
+grep -q '^version: 1.0.25$' "$here/package.yml" || { echo "FAIL: package.yml version must be 1.0.25"; exit 1; }
+echo "PASS: package.yml 1.0.25"
