@@ -42,4 +42,7 @@ d=$(clean); printf '{"ts":"%s","code":1,"reason":"old","outbox_size":0}\n' "$(ts
 expect "lines before --since ignored" "$d" 0 "4/4 criteria PASS"
 d=$(mktemp -d); expect "empty dir (no logs yet) ⇒ exit 0" "$d" 0 "4/4 criteria PASS"
 
+out=$(OBSERVE_NAS=root@nas.invalid bash "$O" --nas --since "$SINCE" 2>&1); rc=$?
+if [ "$rc" -eq 2 ] && ! echo "$out" | grep -q "criteria PASS"; then ok "NAS unreachable ⇒ exit 2, no verdict"; else ko "NAS unreachable (rc=$rc): $out"; fi
+
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

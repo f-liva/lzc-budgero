@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Read-only week verdict for the headless (spec §12.3, M3 plan Task 7).
-#   observe.sh --nas [--since ISO]      fetch the logs from the NAS (root@192.168.8.115) and judge them
+#   observe.sh --nas [--since ISO]      fetch the logs from the NAS (root@192.168.8.115, override OBSERVE_NAS) and judge them;
+#                                       exit 2 if the NAS cannot be reached
 #   observe.sh --dir D [--since ISO]    judge rebuilds.log, halts.log, quarantine.json in D
 # Criteria: (1) rebuilds.log codes only 75 76 77 78 143; (2) halts.log only quarantine/restore_inproc;
 # (3) every quarantine acked; (4) every 24 h window: 75 <= 20 (a 75 right after a 75/76/77 record with
@@ -16,10 +17,16 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+NAS=${OBSERVE_NAS:-root@192.168.8.115}
 if [ "$nas" = 1 ]; then
+  # An unreachable NAS must not look like a clean week: only "file absent" means "no data".
+  ssh -q -o BatchMode=yes -o ConnectTimeout=10 "$NAS" test -d "$NAS_DIR" </dev/null >/dev/null 2>&1 \
+    || { echo "cannot reach $NAS:$NAS_DIR (ssh failed or directory missing)" >&2; exit 2; }
   dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT
   for f in rebuilds.log halts.log quarantine.json; do
-    scp -q -o BatchMode=yes "root@192.168.8.115:$NAS_DIR/$f" "$dir/" 2>/dev/null || true
+    if ssh -q -o BatchMode=yes "$NAS" test -e "$NAS_DIR/$f" </dev/null; then
+      scp -q -o BatchMode=yes "$NAS:$NAS_DIR/$f" "$dir/" || { echo "copy of $f failed" >&2; exit 2; }
+    fi
   done
 fi
 [ -n "$dir" ] || { echo "need --dir or --nas" >&2; exit 2; }

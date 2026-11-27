@@ -57,8 +57,8 @@ services:
   # Config e segreti (config.json, password, space.key, tokens; mode 600, uid 1001) in
   # /lzcapp/var/headless, scritti da docker/headless/provision.sh: senza config resta not_configured.
   # Va aggiornato INSIEME al server: build dallo stesso tag upstream, altrimenti halt version_mismatch.
-  # Nessuna route Lazycat: Ambrogio lo raggiunge dal tunnel Cloudflare (budgero-api.federicoliva.it,
-  # dietro Cloudflare Access). restart: ignorato da Lazycat, il supervisor interno rilancia il worker.
+  # Nessuna route Lazycat: Ambrogio lo raggiunge con una regola dell'app Forward sul bridge lzc_docker
+  # (http://172.18.0.1:8787, solo container del NAS). restart: ignorato da Lazycat, il supervisor rilancia il worker.
   headless:
     image: registry.lazycat.cloud/u30562882/fliva/budgero-headless:f799dd2bde35a9e4
     user: "1001:1001"

@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Superseded in part (26/11/2026):** the Cloudflare route (Goal, Architecture, Tech Stack, Task 5, Review Focus 2 and 5) was replaced by a Lazycat Forward rule on the `lzc_docker` bridge (`http://172.18.0.1:8787`, NAS containers only, bearer tokens the only gate); see spec §15 "M3 amendment 2". The text below keeps the original plan for the record.
+
 **Goal:** The headless runs on the NAS as a second service of the `lzc-budgero` package, read-only, reachable by Ambrogio through a public tunnel hostname behind Cloudflare Access + bearer token, and is observed for 7 days against the spec §12.3 criteria before writes are enabled.
 
 **Architecture:** Service `headless` added to `budgero-lzc/lzc-manifest.yml` (spec §11), talking to the server on the package's internal network (`http://budgero.cloud.lazycat.app.budgero.lzcapp:3001`, Origin `https://${LAZYCAT_APP_DOMAIN}`). Ambrogio is a different lzcapp and Lazycat isolates apps (verified 26/11/2026: from the Ambrogio container the internal name resolves to `fd03:…` and every connect times out; the `heiyu.space` domain answers 307 to the Lazycat login). Federico chose (26/11/2026) to reach the headless through the existing Cloudflare tunnel (`cloudflared` runs on the host network and already reaches `*.lzcapp` names) on a new public hostname, protected at the edge by a Cloudflare Access **service token** and in the app by the bearer tokens.
@@ -30,14 +32,14 @@ Commits in `lzc-budgero` (branch `main`), no AI attribution. Anything that leave
 - Server and headless are pinned together (`version_mismatch` otherwise): any future lzc-budgero server bump ships a headless image built at the same upstream tag in the same release.
 - `services.*.restart` is ignored by Lazycat (RestartPolicy=no): the in-container supervisor is the only restarter (§5).
 - NAS rules (`/AGENTS.md`): no recursive scans of `/`, `/data`, `/lzcsys/data`; read `/lzcsys/data/README` before locating data.
-- `/v1/admin/*` must never be reachable from the internet (edge rule, Task 5); operator admin calls go through `lzc-docker exec … wget localhost:8787`.
+- `/v1/admin/*` must never be reachable from the internet: the Forward rule exposes 8787 only on `lzc_docker` (amendment 2; was the edge rule of Task 5); operator admin calls go through `lzc-docker exec … wget localhost:8787`.
 
 ## Review Focus
 
 1. **NAS nightly power-off 02:00→07:00 and the boot DNS race** (resolver not ready for ~30 s after boot): the headless must come back `live` by itself every morning; 78 retries must not exhaust (20 consecutive) during the DNS window. → Task 6 (reboot check).
 2. **Tunnel down in the morning** (known, lzc-cloudflared): Ambrogio sees Cloudflare 5xx; the headless itself is unaffected (internal URL). → Task 6 asserts the headless does not depend on the tunnel.
 3. **Container restart after a config change** loses nothing: config/secrets on the bind mount survive `lpk-manager` upgrade of the package. → Task 4 (upgrade 1.0.22 → 1.0.22+1 dry run is out of scope; assert files survive one app restart and one reinstall of the same lpk).
-4. **Wrong `budgetId` or wrong `space.key` typed at provisioning**: must end `halted access_denied` / `bootstrap_failed:decrypt`, never a loop, and the operator must see the reason in `/v1/status`. → Task 4.
+4. **Wrong `budgetId` or wrong `space.key` typed at provisioning**: must end `halted access_denied` / `bootstrap_failed:decrypt`, never a loop, and the operator must see the reason in `/v1/status`. → Task 4. (Found in production 26/11/2026: a wrong `budgetId` went `live` with 0 accounts; fixed in the client with `halted config:budget_not_found`, fork 0abf3c82.)
 5. **Access misconfiguration** (service token missing, path rule wrong): a request without the Access headers must never reach the headless. → Task 5 tests from outside with and without headers.
 
 ## Considered and rejected
