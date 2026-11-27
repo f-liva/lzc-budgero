@@ -24,6 +24,8 @@ Create the worktree from `origin/master`:
 Read Ambrogio's `CLAUDE.md`/`AGENTS.md` there first: its commit, test and deploy rules apply. All paths below are
 relative to that worktree. Tests: `npx vitest run <file>`; full gate `npm test && npm run lint`.
 
+> **Status 27/11/2026:** Tasks 1–9 done (Ambrogio `claude/budgero-headless`, 15 commits `d0432308..4d22b137`, subagent-driven, every task reviewed, final whole-branch review + one fix wave), merged into Ambrogio's **local** `master` by fast-forward, **not pushed** (a push to Ambrogio master deploys). Full suite 18,872 passed. Rulings and deferred minors: `2026-11-27-budgero-headless-m4-ambrogio-adapter.ledger.md`. **Task 10 (gated) open.**
+
 ## Global Constraints
 
 - The six tool names and argument schemas in `src/tools/budget-transactions.ts` do not change.
