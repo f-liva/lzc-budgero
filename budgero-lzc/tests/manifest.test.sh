@@ -42,5 +42,5 @@ if fails:
     print("FAIL:\n  " + "\n  ".join(fails)); sys.exit(1)
 print("PASS: manifest headless service")
 EOF
-grep -q '^version: 1.0.25$' "$here/package.yml" || { echo "FAIL: package.yml version must be 1.0.25"; exit 1; }
-echo "PASS: package.yml 1.0.25"
+grep -q '^version: 1.0.26$' "$here/package.yml" || { echo "FAIL: package.yml version must be 1.0.26"; exit 1; }
+echo "PASS: package.yml 1.0.26"

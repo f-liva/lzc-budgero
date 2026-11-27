@@ -60,7 +60,8 @@ services:
   # Nessuna route Lazycat: Ambrogio lo raggiunge con una regola dell'app Forward sul bridge lzc_docker
   # (http://172.18.0.1:8787, solo container del NAS). restart: ignorato da Lazycat, il supervisor rilancia il worker.
   headless:
-    image: registry.lazycat.cloud/u30562882/fliva/budgero-headless:f799dd2bde35a9e4
+    # = fliva/budgero-headless:1.22.1-9 (fork tag headless-v1.22.1-9, commit 9a0d2ca5)
+    image: registry.lazycat.cloud/u30562882/fliva/budgero-headless:60e8794543a13895
     user: "1001:1001"
     # No setup_script: it makes /lzcinit pid 1, which does not forward TERM to the supervisor.
     # The dir is chowned to 1001 by docker/headless/provision.sh.

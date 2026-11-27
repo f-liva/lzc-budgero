@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Closed 27/11/2026:** all tasks done or dropped (Task 5), writes on, lzc-budgero 1.0.26 / headless 1.22.1-9 on the NAS; see the Task 8 status.
+>
 > **Superseded in part (26/11/2026):** the Cloudflare route (Goal, Architecture, Tech Stack, Task 5, Review Focus 2 and 5) was replaced by a Lazycat Forward rule on the `lzc_docker` bridge (`http://172.18.0.1:8787`, NAS containers only, bearer tokens the only gate); see spec §15 "M3 amendment 2". The text below keeps the original plan for the record.
 
 **Goal:** The headless runs on the NAS as a second service of the `lzc-budgero` package, read-only, reachable by Ambrogio through a public tunnel hostname behind Cloudflare Access + bearer token, and is observed for 7 days against the spec §12.3 criteria before writes are enabled.
@@ -126,6 +128,16 @@ Commits in `lzc-budgero` (branch `main`), no AI attribution. Anything that leave
 - [ ] **Step 3:** Vikunja (project 2): day 3 and day 7 reminders with the exact `observe.sh` command and the three spot checks; commit `feat(headless): observation script for the read-only week`.
 
 ### Task 8: Enable writes (gated, after 7 clean days)
+
+> **Status 27/11/2026: done, ahead of the 7 days.** Writes enabled at 11:43 UTC on Federico's decision
+> (`readOnly: false`, done from another session), after one day of read-only observation instead of seven.
+> The first write (a `transactions.add` without `date`, 11:43:53Z) exposed schema gaps: exit 76, nothing on
+> the server. Fixed in the fork (write validation pinned in `test/schemas.runtime.test.ts`, transfer legs,
+> silent defaults, read-only routes closed, worker-lock release) and deployed as image `1.22.1-9`
+> (registry `60e8794543a13895`) in lzc-budgero 1.0.26 at 15:41 UTC: `live` in 2 s, pid 1 `entrypoint.sh`,
+> 143 on stop, `healthy`; in production `POST /v1/transactions` without `date` ⇒ 422 `date`, an unbalanced
+> EUR→EUR transfer ⇒ 422 `destination`, cursor unchanged, no new 76; Ambrogio still reads (200, 35 accounts).
+> **M3 closed 27/11/2026.** Next: M4 (Ambrogio adapter).
 
 - [ ] **Step 1:** `observe.sh --since <live date>` exits 0 and 3 spot checks matched. Federico's go.
 - [ ] **Step 2:** Set `readOnly: false` in `config.json` (operator edit as root, keep mode/owner), restart the container, `/v1/status` `live`, one `POST /v1/transactions` test expense with a fresh `Idempotency-Key` from the NAS (admin side), visible in the web app, then deleted via `DELETE /v1/transactions/{id}`. Update runbook + spec §15 status. M4 (Ambrogio adapter) starts.
