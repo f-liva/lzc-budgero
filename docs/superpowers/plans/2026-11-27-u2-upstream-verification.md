@@ -38,6 +38,16 @@ Prove the tests are about a real defect, not about the new code.
 
 Evidence for the PR: the failing test name and its assertion on `master`.
 
+> **Done 27/11/2026.** With `master`'s sources the patch's 7 tests fail for the wrong reason
+> (`queue.getSendable is not a function`: they test the new API). Added
+> `packages/runtime/src/offline-queue/offline-queue.durability.test.ts` (U2 branch commit after `c2575b2b`),
+> which uses only `getUnsent()` / `getStale()`, the methods the send path reads on `master`
+> (`mutation-dispatch-service.ts:95`, `reconnection-service.ts:342`). On `master`'s sources both cases fail
+> with `expected [ 'm1' ] to deeply equal []` (the entry is sendable while `storage.save` is pending); with
+> the patch they pass, with the 7 persisting tests, and the runtime suite is green (52 files, 416 tests).
+> Upstream v1.23.0 has not touched `offline-queue/`, `mutation-dispatch-service.ts` or
+> `reconnection-service.ts` since the base: the bug is still there.
+
 ### Gate 2 — rebase and the upstream CI, locally
 
 1. `git rebase origin/master` on a new branch `upstream/u2-queue-durability-v1.23`.
